@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import base64
@@ -47,6 +48,7 @@ warnings.filterwarnings(
 
 NODE_ID = "CS_Video_Segment_SAM3"
 PROMPT_VERSION = 2
+MULTI_ANCHOR_PROMPT_VERSION = 3
 _PROPAGATION_OPTIONS = ["both", "forward", "backward"]
 _PREVIEW_ROUTE_REGISTERED = False
 _LAST_MODEL: Any = None
@@ -1546,6 +1548,7 @@ class CSVideoSegmentSeC(io.ComfyNode):
                 io.Mask.Output("anchor_mask", display_name="anchor_mask"),
                 io.Dict.Output("video_info", display_name="video_info"),
             ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
         )
 
     @classmethod
@@ -1720,71 +1723,283 @@ class CSVideoSegmentSeC(io.ComfyNode):
                 torch.cuda.empty_cache()
 
 
-def _unpack_track(result: dict[str, Any], height: int, width: int) -> torch.Tensor | None:
+_OBJECT_PALETTE = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+    (1.0, 1.0, 0.0),
+    (1.0, 0.0, 1.0),
+    (0.0, 1.0, 1.0),
+    (1.0, 0.5, 0.0),
+    (0.5, 0.0, 1.0),
+    (0.0, 1.0, 0.5),
+    (1.0, 0.0, 0.5),
+    (0.5, 1.0, 0.0),
+    (0.0, 0.5, 1.0),
+    (1.0, 1.0, 1.0),
+    (0.5, 0.25, 0.0),
+    (0.5, 0.5, 0.5),
+    (1.0, 0.75, 0.8),
+)
+
+
+def _object_is_prompted(item: Any) -> bool:
+    """Return whether one serialized Selector object carries any prompt."""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("text") or item.get("semantic") or "").strip():
+        return True
+    if item.get("points") or item.get("bbox") or item.get("box"):
+        return True
+    mask = item.get("mask")
+    if isinstance(mask, dict):
+        mask = mask.get("data") or mask.get("png")
+    return bool(str(mask or "").strip())
+
+
+def _parse_anchor_prompts(
+    prompt_data: str | None,
+    anchor_frame: int,
+    frame_count: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Normalize v2 single-anchor and v3 multi-anchor Selector data.
+
+    Returns the global object count and one entry per anchor with the anchor
+    frame, a v2 ``prompt_data`` string containing only the prompted objects,
+    and the global object index of each of those prompts.  Object indices are
+    shared by every anchor so an object keeps its colour across shots.
+    """
+    raw = _parse_json(prompt_data, "prompt_data")
+    if raw is None:
+        raise ValueError("prompt_data is empty. Open the Selector and define at least one object.")
+    if isinstance(raw, dict) and isinstance(raw.get("anchors"), list):
+        anchor_items = raw["anchors"]
+        object_count = int(raw.get("object_count") or 0)
+    else:
+        objects = raw.get("objects") if isinstance(raw, dict) else raw
+        anchor_items = [{"frame": anchor_frame, "objects": objects}]
+        object_count = 0
+
+    anchors: dict[int, dict[str, Any]] = {}
+    for index, item in enumerate(anchor_items):
+        if not isinstance(item, dict) or not isinstance(item.get("objects"), list):
+            raise ValueError(f"prompt_data.anchors[{index}] must contain an objects list.")
+        try:
+            frame = int(item.get("frame"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"prompt_data.anchors[{index}] has an invalid frame.") from exc
+        if not 0 <= frame < frame_count:
+            raise ValueError(f"Anchor frame {frame} is outside the input range 0..{frame_count - 1}.")
+        object_count = max(object_count, len(item["objects"]))
+        prompted = [(slot, obj) for slot, obj in enumerate(item["objects"]) if _object_is_prompted(obj)]
+        if not prompted:
+            continue
+        anchors[frame] = {
+            "frame": frame,
+            "prompt_data": json.dumps({"version": PROMPT_VERSION, "objects": [obj for _, obj in prompted]}),
+            "object_indices": [slot for slot, _ in prompted],
+        }
+    if not anchors:
+        raise ValueError("prompt_data must contain at least one prompted object.")
+    return max(1, object_count), [anchors[frame] for frame in sorted(anchors)]
+
+
+def _detect_shot_cuts(images: torch.Tensor) -> list[int]:
+    """Find hard cuts as isolated spikes in the colour-histogram distance.
+
+    A cut changes the colour distribution in one frame while the frames on
+    either side stay stable.  Motion blur, whip pans and muzzle flashes change
+    it over several consecutive frames instead, so a spike must dominate both
+    neighbours to count.  Returns the first frame index of every new shot.
+    """
+    frame_count = int(images.shape[0])
+    if frame_count < 2:
+        return []
+    histograms: list[torch.Tensor] = []
+    thumbs: list[torch.Tensor] = []
+    for start in range(0, frame_count, 64):
+        chunk = images[start : start + 64, ..., :3].movedim(-1, 1).float()
+        if not images.is_floating_point():
+            chunk = chunk / 255.0
+        small = F.interpolate(chunk, size=(36, 64), mode="area").clamp_(0.0, 1.0)
+        thumbs.append(small)
+        bins = (small * 7.999).long()
+        index = (bins[:, 0] * 64 + bins[:, 1] * 8 + bins[:, 2]).flatten(1)
+        counts = torch.zeros(index.shape[0], 512, dtype=torch.float32)
+        counts.scatter_add_(1, index, torch.ones_like(index, dtype=torch.float32))
+        histograms.append(counts / index.shape[1])
+    hist = torch.cat(histograms)
+    thumb = torch.cat(thumbs)
+    hist_delta = 0.5 * (hist[1:] - hist[:-1]).abs().sum(dim=1)
+    pixel_delta = (thumb[1:] - thumb[:-1]).abs().mean(dim=(1, 2, 3))
+
+    candidates: list[tuple[int, float]] = []
+    count = int(hist_delta.shape[0])
+    for k in range(count):
+        value = float(hist_delta[k])
+        neighbour = max(
+            float(hist_delta[k - 1]) if k > 0 else 0.0,
+            float(hist_delta[k + 1]) if k + 1 < count else 0.0,
+        )
+        if value >= 0.06 and value >= 2.5 * neighbour and float(pixel_delta[k]) >= 0.03:
+            candidates.append((k + 1, value))
+    # Keep the strongest cut when several spikes land within a few frames.
+    cuts: list[tuple[int, float]] = []
+    for frame, value in candidates:
+        if cuts and frame - cuts[-1][0] < 8:
+            if value > cuts[-1][1]:
+                cuts[-1] = (frame, value)
+            continue
+        cuts.append((frame, value))
+    return [frame for frame, _ in cuts]
+
+
+def _parse_cut_frames(value: str | None, frame_count: int) -> list[int] | None:
+    """Parse a manual ``12, 80, 144`` cut list; ``None`` means auto-detect."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        frames = [int(float(part)) for part in re.split(r"[\s,;\[\]]+", text) if part]
+    except ValueError as exc:
+        raise ValueError("shot_cut_frames must be a comma-separated list of frame numbers.") from exc
+    return sorted({frame for frame in frames if 0 < frame < frame_count})
+
+
+def _anchor_segments(
+    anchor_frames: list[int],
+    cuts: list[int],
+    frame_count: int,
+    direction: str,
+) -> list[tuple[int, int, int]]:
+    """Assign every frame to at most one anchor as ``(anchor, start, end)``.
+
+    Segments never cross a shot cut.  Inside one shot, neighbouring anchors
+    split the frames between them; shots without an anchor stay empty rather
+    than inheriting a track that has drifted onto someone else.
+    """
+    bounds = [0, *[cut for cut in cuts if 0 < cut < frame_count], frame_count]
+    segments: list[tuple[int, int, int]] = []
+    for shot_start, shot_end in zip(bounds[:-1], bounds[1:]):
+        inside = [frame for frame in anchor_frames if shot_start <= frame < shot_end]
+        for index, anchor in enumerate(inside):
+            previous = inside[index - 1] if index > 0 else None
+            following = inside[index + 1] if index + 1 < len(inside) else None
+            if direction == "forward":
+                start, end = anchor, following if following is not None else shot_end
+            elif direction == "backward":
+                start, end = (previous + 1) if previous is not None else shot_start, anchor + 1
+            else:
+                start = (previous + anchor + 1) // 2 if previous is not None else shot_start
+                end = (anchor + following + 1) // 2 if following is not None else shot_end
+            segments.append((anchor, start, end))
+    return segments
+
+
+def _parse_object_colors(value: str | None, object_count: int) -> torch.Tensor:
+    """Return ``[object_count + 1, 3]`` colours; row 0 is the black background."""
+    colors = [list(color) for color in _OBJECT_PALETTE]
+    for index, part in enumerate(re.split(r"[\s,;]+", str(value or "").strip())):
+        if not part:
+            continue
+        match = re.fullmatch(r"#?([0-9a-fA-F]{6})", part)
+        if match is None:
+            raise ValueError(f"object_colors entry {part!r} must be a hex colour such as #FF0000.")
+        rgb = [int(match.group(1)[offset : offset + 2], 16) / 255.0 for offset in (0, 2, 4)]
+        if index < len(colors):
+            colors[index] = rgb
+        else:
+            colors.append(rgb)
+    while len(colors) < object_count:
+        colors.append(colors[len(colors) % len(_OBJECT_PALETTE)])
+    return torch.tensor([[0.0, 0.0, 0.0], *colors[:object_count]], dtype=torch.float32)
+
+
+def _write_track(
+    result: dict[str, Any],
+    frame_indices: list[int],
+    object_indices: list[int],
+    union: torch.Tensor,
+    labels: torch.Tensor,
+) -> None:
+    """Resize a packed SAM3 track and store its union mask and object labels."""
     packed = result.get("packed_masks")
     if packed is None:
-        return None
+        return
     from comfy.ldm.sam3.tracker import unpack_masks
 
-    unpacked = unpack_masks(packed).float()  # [T, N_obj, Hm, Wm]
+    unpacked = unpack_masks(packed)  # [T, N_obj, Hm, Wm]
     if unpacked.ndim != 4:
-        return None
-    frames, objects = unpacked.shape[:2]
-    resized = F.interpolate(
-        unpacked.reshape(frames * objects, 1, *unpacked.shape[-2:]),
-        size=(height, width),
-        mode="bilinear",
-        align_corners=False,
-    )
-    return resized.reshape(frames, objects, height, width).amax(dim=1)
+        return
+    height, width = int(union.shape[1]), int(union.shape[2])
+    lookup = torch.tensor([index + 1 for index in object_indices], dtype=torch.uint8)
+    frames = min(int(unpacked.shape[0]), len(frame_indices))
+    objects = min(int(unpacked.shape[1]), len(object_indices))
+    for start in range(0, frames, 16):
+        chunk = unpacked[start : min(frames, start + 16), :objects].to("cpu").float()
+        steps = int(chunk.shape[0])
+        soft = F.interpolate(
+            chunk.reshape(steps * objects, 1, *chunk.shape[-2:]),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(steps, objects, height, width)
+        strongest, owner = soft.max(dim=1)
+        for step in range(steps):
+            target = frame_indices[start + step]
+            union[target] = strongest[step]
+            labels[target] = torch.where(strongest[step] > 0, lookup[owner[step]], 0)
 
 
-def _propagate(
+def _propagate_segments(
     model: Any,
     images: torch.Tensor,
-    anchor_masks: torch.Tensor,
-    anchor_frame: int,
-    direction: str,
+    anchors: list[dict[str, Any]],
+    segments: list[tuple[int, int, int]],
     pbar: Any,
     max_objects: int,
-) -> torch.Tensor:
-    """Propagate from the anchor in one or both temporal directions."""
-    frame_count, height, width = images.shape[:3]
-    output = torch.zeros(frame_count, height, width, dtype=torch.float32)
-    output[anchor_frame] = anchor_masks.amax(dim=0).to("cpu").float()
-
+    union: torch.Tensor,
+    labels: torch.Tensor,
+) -> None:
+    """Track each anchor's objects only inside that anchor's segment."""
     comfy.model_management.load_model_gpu(model)
     device = comfy.model_management.get_torch_device()
     dtype = model.model.get_dtype()
     sam3_model = model.model.diffusion_model
     frames_chw = images[..., :3].movedim(-1, 1)
+    by_frame = {anchor["frame"]: anchor for anchor in anchors}
 
-    def run_sequence(sequence: torch.Tensor) -> torch.Tensor | None:
+    def run(sequence: torch.Tensor, masks: torch.Tensor, frame_indices: list[int], object_indices: list[int]) -> None:
         with torch.no_grad():
             result = sam3_model.forward_video(
                 images=sequence,
-                initial_masks=anchor_masks,
+                initial_masks=masks,
                 pbar=pbar,
                 text_prompts=None,
                 max_objects=max_objects,
                 target_device=device,
                 target_dtype=dtype,
             )
-        return _unpack_track(result, height, width)
+        _write_track(result, frame_indices, object_indices, union, labels)
 
-    if direction in {"both", "forward"} and anchor_frame + 1 < frame_count:
-        forward = run_sequence(frames_chw[anchor_frame:])
-        if forward is not None:
-            output[anchor_frame:] = forward
-
-    if direction in {"both", "backward"} and anchor_frame > 0:
-        backward = run_sequence(frames_chw[: anchor_frame + 1].flip(0))
-        if backward is not None:
-            chronological = backward.flip(0)
-            output[: anchor_frame + 1] = chronological
-
-    output[anchor_frame] = anchor_masks.amax(dim=0).to("cpu").float()
-    return output.clamp_(0.0, 1.0)
+    for anchor_frame, start, end in segments:
+        anchor = by_frame[anchor_frame]
+        masks = anchor["masks"]
+        object_indices = anchor["object_indices"]
+        if end - anchor_frame > 1:
+            run(frames_chw[anchor_frame:end], masks, list(range(anchor_frame, end)), object_indices)
+        if anchor_frame - start > 0:
+            run(
+                frames_chw[start : anchor_frame + 1].flip(0),
+                masks,
+                list(range(anchor_frame, start - 1, -1)),
+                object_indices,
+            )
+        # The prompted anchor result is authoritative on its own frame.
+        strongest, owner = masks.max(dim=0)
+        lookup = torch.tensor([index + 1 for index in object_indices], dtype=torch.uint8)
+        union[anchor_frame] = strongest
+        labels[anchor_frame] = torch.where(strongest > 0, lookup[owner], 0)
 
 
 class CSVideoSegmentSAM3(io.ComfyNode):
@@ -1846,6 +2061,32 @@ class CSVideoSegmentSAM3(io.ComfyNode):
                     tooltip="Maximum SAM3.1 multiplex object slots.",
                 ),
                 io.Boolean.Input(
+                    "stop_at_shot_cuts",
+                    default=True,
+                    tooltip=(
+                        "Stop tracking at detected shot cuts. Each shot is tracked only from the anchors "
+                        "placed inside it; shots without an anchor produce an empty mask."
+                    ),
+                ),
+                io.String.Input(
+                    "shot_cut_frames",
+                    default="",
+                    advanced=True,
+                    tooltip=(
+                        "Optional comma-separated first frames of each new shot, e.g. 266, 422. "
+                        "Leave empty to detect cuts automatically."
+                    ),
+                ),
+                io.String.Input(
+                    "object_colors",
+                    default="",
+                    advanced=True,
+                    tooltip=(
+                        "Optional comma-separated hex colours for Object 1, 2, ... in color_mask. "
+                        "Empty uses red, green, blue, yellow, magenta, cyan, ..."
+                    ),
+                ),
+                io.Boolean.Input(
                     "wait_for_input_cache",
                     display_name="wait for input cache",
                     default=False,
@@ -1857,7 +2098,9 @@ class CSVideoSegmentSAM3(io.ComfyNode):
                 io.Mask.Output("mask", display_name="MASK"),
                 io.Mask.Output("anchor_mask", display_name="anchor_mask"),
                 io.Dict.Output("video_info", display_name="video_info"),
+                io.Image.Output("color_mask", display_name="color_mask"),
             ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
         )
 
     @classmethod
@@ -1870,6 +2113,9 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         prompt_data: str = '{"version":2,"objects":[]}',
         propagation_direction: str = "both",
         max_objects: int = 16,
+        stop_at_shot_cuts: bool = True,
+        shot_cut_frames: str = "",
+        object_colors: str = "",
         wait_for_input_cache: bool = False,
     ) -> io.NodeOutput:
         global _LAST_MODEL
@@ -1909,9 +2155,6 @@ class CSVideoSegmentSAM3(io.ComfyNode):
 
             raise InterruptProcessingException()
         frame_count, height, width = map(int, images.shape[:3])
-        anchor = int(anchor_frame)
-        if anchor < 0 or anchor >= frame_count:
-            raise ValueError(f"anchor_frame must be between 0 and {frame_count - 1}.")
         if propagation_direction not in _PROPAGATION_OPTIONS:
             raise ValueError(f"propagation_direction must be one of {_PROPAGATION_OPTIONS}.")
 
@@ -1920,42 +2163,246 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         # pass more than the architectural cap to the tracker.
         object_limit = min(16, max(1, int(max_objects)))
 
-        anchor_mask_objects = _sam3_anchor_masks(model, images[anchor : anchor + 1], prompt_data)
-        _segment_info(node_name, f"anchor prompts segmented: objects={anchor_mask_objects.shape[0]}")
-        if anchor_mask_objects.shape[0] > object_limit:
-            anchor_mask_objects = anchor_mask_objects[:object_limit]
-        anchor_mask = anchor_mask_objects.amax(dim=0).to("cpu").float().clamp_(0.0, 1.0)
+        object_count, anchors = _parse_anchor_prompts(prompt_data, int(anchor_frame), frame_count)
+        for anchor in anchors:
+            frame = anchor["frame"]
+            if len(anchor["object_indices"]) > object_limit:
+                dropped = [index + 1 for index in anchor["object_indices"][object_limit:]]
+                _SEGMENT_LOGGER.warning(
+                    "[%s] anchor %d has more objects than max_objects=%d; skipping Object %s",
+                    node_name, frame, object_limit, dropped,
+                )
+            masks = _sam3_anchor_masks(model, images[frame : frame + 1], anchor["prompt_data"])
+            anchor["masks"] = masks[:object_limit]
+            anchor["object_indices"] = anchor["object_indices"][:object_limit]
+            _segment_info(node_name, f"anchor {frame} prompts segmented: objects={int(anchor['masks'].shape[0])}")
+        anchor_frames = [anchor["frame"] for anchor in anchors]
 
-        progress_total = _segment_expected_frames(frame_count, anchor, propagation_direction)
+        cuts: list[int] = []
+        if stop_at_shot_cuts:
+            manual_cuts = _parse_cut_frames(shot_cut_frames, frame_count)
+            cuts = manual_cuts if manual_cuts is not None else _detect_shot_cuts(images)
+            _segment_info(node_name, f"{'manual' if manual_cuts is not None else 'detected'} shot cuts: {cuts}")
+        segments = _anchor_segments(anchor_frames, cuts, frame_count, propagation_direction)
+        empty_shots = [
+            [start, end]
+            for start, end in zip([0, *cuts], [*cuts, frame_count])
+            if not any(start <= frame < end for frame in anchor_frames)
+        ]
+        if empty_shots:
+            _segment_info(node_name, f"shots without an anchor (empty mask): {empty_shots}")
+
+        union = torch.zeros(frame_count, height, width, dtype=torch.float32)
+        labels = torch.zeros(frame_count, height, width, dtype=torch.uint8)
+        progress_total = max(1, sum((end - anchor if end - anchor > 1 else 0) + (anchor - start + 1 if anchor > start else 0) for anchor, start, end in segments))
         backend_pbar = comfy.utils.ProgressBar(progress_total)
-        _segment_info(node_name, f"propagating masks: direction={propagation_direction}")
+        _segment_info(
+            node_name,
+            f"propagating masks: direction={propagation_direction}, anchors={anchor_frames}, segments={len(segments)}",
+        )
         pbar = _SegmentProgress(node_name, progress_total, backend_pbar)
         nested_tqdm = _NestedTqdmSilencer(("comfy.ldm.sam3.tracker",))
         nested_tqdm.start()
         try:
-            mask = _propagate(
-                model,
-                images,
-                anchor_mask_objects,
-                anchor,
-                propagation_direction,
-                pbar,
-                object_limit,
-            )
+            _propagate_segments(model, images, anchors, segments, pbar, object_limit, union, labels)
         finally:
             nested_tqdm.stop()
             pbar.close()
+        union.clamp_(0.0, 1.0)
+
+        palette = _parse_object_colors(object_colors, object_count)
+        color_mask = torch.empty(frame_count, height, width, 3, dtype=torch.float32)
+        for start in range(0, frame_count, 32):
+            end = min(frame_count, start + 32)
+            color_mask[start:end] = palette[labels[start:end].long()] * union[start:end, ..., None]
+        del labels
+
+        anchor_mask = anchors[0]["masks"].amax(dim=0).to("cpu").float().clamp_(0.0, 1.0)
         info = {
             "frame_count": frame_count,
             "height": height,
             "width": width,
-            "anchor_frame": anchor,
+            "anchor_frame": anchor_frames[0],
+            "anchor_frames": anchor_frames,
             "propagation_direction": propagation_direction,
-            "prompt_version": PROMPT_VERSION,
-            "object_count": int(anchor_mask_objects.shape[0]),
+            "prompt_version": PROMPT_VERSION if len(anchors) == 1 else MULTI_ANCHOR_PROMPT_VERSION,
+            "object_count": object_count,
+            "object_colors": ["#%02X%02X%02X" % tuple(round(float(v) * 255) for v in row) for row in palette[1:]],
+            "stop_at_shot_cuts": bool(stop_at_shot_cuts),
+            "shot_cuts": cuts,
+            "segments": [{"anchor": anchor, "start": start, "end": end} for anchor, start, end in segments],
         }
-        _segment_info(node_name, f"complete: frames={frame_count}, object_count={int(anchor_mask_objects.shape[0])}")
-        return io.NodeOutput(mask, anchor_mask, info)
+        _segment_info(node_name, f"complete: frames={frame_count}, anchors={len(anchors)}, object_count={object_count}")
+        return io.NodeOutput(union, anchor_mask, info, color_mask)
+
+
+_SHOT_PREVIEW_CUT_CACHE: dict[str, list[int]] = {}
+_SHOT_PREVIEW_LOCK = threading.Lock()
+
+
+def _selector_frame_batch(payload: dict[str, Any]) -> np.ndarray:
+    """Load every cached Selector input frame as ``uint8 [F, H, W, 3]``.
+
+    Shot previews need whole shots and cut detection, so only cached inputs
+    are accepted: they are guaranteed to match the node's own frames.
+    """
+    token = str(payload.get("source_token") or "").strip()
+    if not token:
+        raise ValueError(
+            "Preview Current Shot needs the node input cache. Set wait_for_input_cache to true, "
+            "run the workflow once, set it back to false and reopen the Selector."
+        )
+    if token.startswith("loader_preview:"):
+        cache = _loader_preview_cache()
+        entry = cache.entry_for_token(token) if cache is not None else None
+        if entry is None:
+            raise ValueError("The shared loader preview cache is unavailable.")
+        frames: list[np.ndarray] = []
+        with av.open(str(entry["video_path"]), mode="r") as container:
+            for decoded in container.decode(container.streams.video[0]):
+                frames.append(decoded.to_ndarray(format="rgb24"))
+        if not frames:
+            raise ValueError("The loader preview cache contains no frames.")
+        return np.stack(frames, axis=0)
+    if token.startswith("wait_input:"):
+        package = __name__.rsplit(".", 1)[0]
+        module = sys.modules.get(f"{package}._py_preview_cache")
+        entry = module.get_wait_input_cache_store().get_token(token) if module is not None else None
+    else:
+        entry = _selector_cache_for_token(token)
+    if entry is None:
+        raise ValueError("The cached Selector input is no longer available. Run the workflow once again.")
+    try:
+        return np.load(str(entry["frames_path"]), mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError("The cached Selector frames are unavailable. Run the workflow once again.") from exc
+
+
+def _encode_png(array: np.ndarray, mode: str) -> str:
+    buffer = py_io.BytesIO()
+    Image.fromarray(array, mode=mode).save(buffer, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _encode_jpeg(array: np.ndarray) -> str:
+    buffer = py_io.BytesIO()
+    Image.fromarray(array, mode="RGB").save(buffer, format="JPEG", quality=82)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _shot_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    """Track only the shot containing ``frame`` and summarize every frame."""
+    frames_u8 = _selector_frame_batch(payload)
+    frame_count = int(frames_u8.shape[0])
+    frame = min(max(0, int(payload.get("frame", 0))), frame_count - 1)
+    height, width = int(frames_u8.shape[1]), int(frames_u8.shape[2])
+
+    model = _preview_model(payload.get("model_source"))
+    if model is None:
+        raise ValueError(
+            "Connect a CheckpointLoaderSimple or Load Diffusion Model node to MODEL, "
+            "or run this SAM3 node once before using Preview."
+        )
+    direction = str(payload.get("propagation_direction") or "both")
+    if direction not in _PROPAGATION_OPTIONS:
+        direction = "both"
+    object_limit = min(16, max(1, int(payload.get("max_objects") or 16)))
+    object_count, anchors = _parse_anchor_prompts(payload.get("prompt_data"), frame, frame_count)
+
+    cuts: list[int] = []
+    cut_source = "disabled"
+    if bool(payload.get("stop_at_shot_cuts", True)):
+        manual = _parse_cut_frames(payload.get("shot_cut_frames"), frame_count)
+        if manual is not None:
+            cuts, cut_source = manual, "manual"
+        else:
+            key = f"{payload.get('source_token')}:{frame_count}"
+            with _SHOT_PREVIEW_LOCK:
+                cached = _SHOT_PREVIEW_CUT_CACHE.get(key)
+            if cached is None:
+                cached = _detect_shot_cuts(torch.from_numpy(np.asarray(frames_u8)))
+                with _SHOT_PREVIEW_LOCK:
+                    _SHOT_PREVIEW_CUT_CACHE[key] = cached
+            cuts, cut_source = cached, "detected"
+    bounds = [0, *cuts, frame_count]
+    start = max(value for value in bounds[:-1] if value <= frame)
+    end = min(value for value in bounds[1:] if value > frame)
+
+    shot_anchors = [dict(anchor) for anchor in anchors if start <= anchor["frame"] < end]
+    if not shot_anchors:
+        raise ValueError(f"Shot {start}-{end - 1} has no anchor. Prompt an object on a frame inside this shot first.")
+    images = torch.from_numpy(np.array(frames_u8[start:end], copy=True)).to(torch.float32).div_(255.0)
+    shot_frames = end - start
+    for anchor in shot_anchors:
+        local = anchor["frame"] - start
+        anchor["frame"] = local
+        anchor["masks"] = _sam3_anchor_masks(model, images[local : local + 1], anchor["prompt_data"])[:object_limit]
+        anchor["object_indices"] = anchor["object_indices"][:object_limit]
+    segments = _anchor_segments([anchor["frame"] for anchor in shot_anchors], [], shot_frames, direction)
+    union = torch.zeros(shot_frames, height, width, dtype=torch.float32)
+    labels = torch.zeros(shot_frames, height, width, dtype=torch.uint8)
+    nested_tqdm = _NestedTqdmSilencer(("comfy.ldm.sam3.tracker",))
+    nested_tqdm.start()
+    try:
+        _propagate_segments(model, images, shot_anchors, segments, None, object_limit, union, labels)
+    finally:
+        nested_tqdm.stop()
+
+    palette = _parse_object_colors(payload.get("object_colors"), object_count)
+    colors_u8 = (palette * 255.0).round().to(torch.uint8)
+    pixels = float(height * width)
+    areas = [
+        [round(float((labels[step] == index + 1).sum()) / pixels, 5) for step in range(shot_frames)]
+        for index in range(object_count)
+    ]
+    # Overlays only need to match the Selector canvas, not the source size.
+    scale = min(1.0, 480.0 / max(1, width))
+    overlay_size = (max(1, round(height * scale)), max(1, round(width * scale)))
+    overlays: list[str] = []
+    for step in range(shot_frames):
+        small_labels = F.interpolate(labels[step][None, None].float(), size=overlay_size, mode="nearest")[0, 0].long()
+        small_alpha = F.interpolate(union[step][None, None], size=overlay_size, mode="bilinear", align_corners=False)[0, 0]
+        rgba = torch.zeros(*overlay_size, 4, dtype=torch.uint8)
+        rgba[..., :3] = colors_u8[small_labels]
+        rgba[..., 3] = torch.where(small_labels > 0, small_alpha * 150.0, torch.zeros_like(small_alpha)).round().to(torch.uint8)
+        overlays.append(_encode_png(rgba.numpy(), "RGBA"))
+
+    thumb_count = min(shot_frames, 10)
+    thumb_steps = sorted({round(index * (shot_frames - 1) / max(1, thumb_count - 1)) for index in range(thumb_count)})
+    thumb_size = (max(1, round(height * 160.0 / width)), 160)
+    thumbs: list[dict[str, Any]] = []
+    for step in thumb_steps:
+        source = F.interpolate(images[step].movedim(-1, 0)[None], size=thumb_size, mode="area")[0].movedim(0, -1)
+        small_labels = F.interpolate(labels[step][None, None].float(), size=thumb_size, mode="nearest")[0, 0].long()
+        alpha = (small_labels > 0).float()[..., None] * 0.55
+        mixed = source * (1.0 - alpha) + palette[small_labels] * alpha
+        thumbs.append({"frame": start + step, "image": _encode_jpeg((mixed * 255.0).round().clamp(0, 255).to(torch.uint8).numpy())})
+
+    return {
+        "start": start,
+        "end": end,
+        "cuts": cuts,
+        "cut_source": cut_source,
+        "anchors": [anchor["frame"] + start for anchor in shot_anchors],
+        "object_colors": ["#%02X%02X%02X" % tuple(int(v) for v in row) for row in colors_u8[1:].tolist()],
+        "areas": areas,
+        "overlays": overlays,
+        "thumbs": thumbs,
+    }
+
+
+async def _video_segment_shot_preview_route(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+        from server import PromptServer
+
+        server_instance = getattr(PromptServer, "instance", None)
+        if server_instance is not None and not hasattr(server_instance, "last_prompt_id"):
+            server_instance.last_prompt_id = "cinestyle-preview"
+        result = await asyncio.to_thread(_shot_preview, payload)
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
 
 class VideoSegmentExtension(ComfyExtension):
@@ -1970,6 +2417,9 @@ class VideoSegmentExtension(ComfyExtension):
         if server_instance is not None:
             server_instance.routes.post("/cinestyle/video-segment-preview")(
                 _video_segment_preview_route
+            )
+            server_instance.routes.post("/cinestyle/video-segment-shot-preview")(
+                _video_segment_shot_preview_route
             )
             server_instance.routes.get("/cinestyle/sec-models")(
                 _sec_video_segment_models_route

@@ -39,6 +39,7 @@ workflow JSON 和示例素材位于插件的 `workflows` 子目录。本文档�
 * 添加 [CS Video Subtitle](#cs-video-subtitle) 节点，将 SRT 字幕渲染到标准 ComfyUI VIDEO，并提供字幕时间线编辑器。
 * 添加 [CS MOSS Audio Transcribe](#cs-moss-audio-transcribe) 节点，将标准 ComfyUI AUDIO 转写为带时间戳的 SRT。
 * 添加 [CS VFX Beauty](#cs-vfx-beauty) 节点，自动估算视频片段肤色并执行皮肤磨皮美化处理。
+* 添加 [CS Shot Planner](#cs-shot-planner) 节点，把长视频按镜头切点打包成多个生成片段，逐段排队处理。
 * 添加 [CS Video Segment (SAM3.1)](#cs-video-segment-sam31) 节点，在锚点帧用 Semantic、粗略 Mask、Point 或 BBox 定义对象，并自动传播 mask。
 * 添加 [CS Video Segment (SeC-4B)](#cs-video-segment-sec-4b) 节点，使用 SeC-4B 的概念理解和 LongSAM2.1 记忆传播 mask。
 * 添加 [CS SeC-4B Model Loader](#cs-sec-4b-model-loader) 节点，用于加载和复用 SeC-4B 推理模型。
@@ -467,7 +468,7 @@ Preview 窗口上半部分为当前帧的匹配对比视口，下半部分为颜
 - video_info：包含帧数、尺寸、锚点帧、传播方向和对象数量。
 
 ### CS Video Segment (SAM3.1)
-使用 ComfyUI 官方 SAM3/SAM3.1 模型和推理内核，把 Selector 中定义在锚点帧的多个对象提示传播到整段视频。
+使用 ComfyUI 官方 SAM3/SAM3.1 模型和推理内核，把 Selector 中定义在锚点帧的多个对象提示传播到整段视频。支持多个锚点帧：跟踪在镜头切点处停止，每个镜头只从该镜头内的锚点传播，并可按对象输出不同颜色的伪彩遮罩。
 SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1)。下载后放入 ComfyUI 的 `models/checkpoints`
 ![SAM3.1 示例工作流](images/CS_Video_Segment(SAM3.1)_workflow.jpg)
 
@@ -476,26 +477,66 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 1. 使用官方 `CheckpointLoaderSimple`加载 SAM3/SAM3.1 模型，并连接节点的 `model`。
 2. 将 CS Load Video 的 `IMAGE` 或 `VIDEO` 输出连接到节点。`images` 与 `video_input` 同时连接时，节点优先使用 `images`；其他上游输入可通过 `wait_for_input_cache` 建立共享预览缓存。
 3. 点击节点上的 `Open Selector`，在实际输入视频的帧上定义提示。
-4. 点击 Selector 的 `Preview Current Frame` 检查当前帧分割结果，确认后点击 `Apply to Node`。
-5. 执行节点，得到整段视频的 mask。
-6. 如果输入来自上游运行后才生成的图像或视频，首次打开 `Open Selector` 前先设置`wait_for_input_cache` 为 `ture` 并运行一次工作流，建立 Preview cache。
+4. 视频有切镜时，在每个需要抠像的镜头各选一帧添加提示，使其成为锚点。同一人物始终使用同一个 Object。
+5. 点击 Selector 的 `Preview Current Frame` 检查当前帧分割结果，确认后点击 `Apply to Node`。
+6. 执行节点，得到整段视频的 mask 和 color_mask。
+7. 如果输入来自上游运行后才生成的图像或视频，首次打开 `Open Selector` 前先设置`wait_for_input_cache` 为 `ture` 并运行一次工作流，建立 Preview cache。
 
 #### 节点选项说明
 ![CS Video Segment (SAM3.1) 节点](images/CS_Video_Segment(SAM3.1)_node.jpg)
 - model：官方 SAM3/SAM3.1 模型，必需输入。
 - images：可选 `IMAGE` 帧批次。直连 `CS Load Video` 时可直接回溯来源；其他上游输入可通过 `wait_for_input_cache` 建立共享预览缓存后使用。
 - video_input：可选 `VIDEO` 输入，仅在 `images` 未连接时使用。直连 `CS Load Video` 时可直接回溯来源；其他上游输入可通过 `wait_for_input_cache` 建立共享预览缓存后使用。
-- anchor_frame：锚点帧在当前输入帧批次中的本地编号，从 `0` 开始。通常由 Selector 自动写入。
-- prompt_data：Selector 序列化的 Mask、BBox、Point 和对象列表，不建议手动编辑。
-- propagation_direction：传播方向，`both` 双向传播，`forward` 向后传播，`backward` 向前传播。
+- anchor_frame：第一个锚点帧在当前输入帧批次中的本地编号，从 `0` 开始。通常由 Selector 自动写入。
+- prompt_data：Selector 序列化的锚点、Mask、BBox、Point 和对象列表，不建议手动编辑。
+- propagation_direction：传播方向，`both` 双向传播，`forward` 向后传播，`backward` 向前传播。同一镜头内有多个锚点时，`both` 以相邻锚点的中点划分各自负责的帧。
 - max_objects：SAM3.1 的最大对象槽数量，默认 `16`。
+- stop_at_shot_cuts：默认开启。跟踪在镜头切点处停止，每个镜头只使用该镜头内的锚点；没有锚点的镜头输出空 mask。关闭后不检测切点，多个锚点之间按中点划分。
+- shot_cut_frames：可选，手动指定每个新镜头的第一帧，例如 `266, 422, 478`。留空时自动检测切点。自动检测可能漏掉动态模糊中的切点，或把极快的动作误判为切点，检测结果会写入日志和 `video_info.shot_cuts`。多检测出的切点只会把镜头多分一段（该段没有锚点时输出空 mask）；漏掉的切点会让 mask 延续到下一个镜头的其他人物上，此时请把该切点补进 `shot_cut_frames`。
+- object_colors：可选，以逗号分隔的十六进制颜色，依次对应 Object 1、2、3……，例如 `#FF0000, #00FF00`。留空时依次使用红、绿、蓝、黄、品红、青……
 - wait_for_input_cache：布尔开关，默认关闭。开启后执行节点时，将当前输入节点及其全部上游节点的链路指纹写入公共 Preview cache，然后中断本次 ComfyUI 执行。
 - Open Selector：打开交互式提示编辑器。
 
 #### 输出说明
 - mask：分割的视频 mask。
-- anchor_mask：锚点帧的分割 mask。
-- video_info：包含帧数、尺寸、锚点帧、传播方向和对象数量。
+- anchor_mask：第一个锚点帧的分割 mask。
+- video_info：包含帧数、尺寸、锚点帧列表、传播方向、对象数量、对象颜色、镜头切点和各锚点负责的帧范围。
+- color_mask：伪彩遮罩 `IMAGE`，黑色背景，每个 Object 使用固定颜色，同一对象在所有镜头中颜色一致。
+
+### CS Shot Planner
+把长视频按镜头切点打包成多个适合生成的片段，每次运行输出其中一段。配合 ComfyUI 的批次数量，一次排队即可依序处理整段视频。
+
+#### 使用流程
+
+1. `images` 接完整视频帧（与 `CS Video Segment (SAM3.1)` 的 `images` 同一来源），`video_info`、`color_mask` 分别接 SAM3.1 节点的同名输出；需要音频时接 `audio`。
+2. 片段输出 `IMAGE`、`color_mask`、`MASK`、`AUDIO` 接到后续生成流程，`frame_count` 接生成长度，`shot_text` 拼接进提示词。
+3. 先运行一次，在节点输出或日志中确认 `chunk_count` 与分段结果。
+4. 将 `chunk_index` 设为 `0`、control 设为 `increment`，把 ComfyUI 的批次数量设为 `chunk_count`，点击运行。上游节点（读取视频、SAM3.1 分割）在各次运行之间会使用缓存，不会重复计算。
+5. `chunk_index` 超出范围时节点会报错，重新处理前请将其设回 `0`。
+
+#### 分段规则
+
+- 片段边界只落在镜头切点上，不会从镜头中间切开；相邻镜头会被合并，使每段尽量接近 `target_seconds`，不超过 `max_seconds`，并尽量不短于 `min_seconds`。
+- 单个镜头长于 `max_seconds` 时，会在镜头内部平均切开，日志会给出警告。
+- 生成长度会向上取整为 `frame_offset + k × frame_step`（MiniMax 为 `5 + 17k`）。多出的帧取自下一个镜头的开头，最后一段则重复最后一帧补齐；`shot_text` 会标明这些补齐帧，拼接成片时需要裁掉。
+- 切点来源优先级：`shot_cut_frames` → `video_info.shot_cuts` → 自动检测（与 SAM3.1 节点使用同一检测器）。
+
+#### 节点选项说明
+
+- chunk_index：本次输出的片段编号，从 `0` 开始。
+- fps：`images` 的帧率。
+- target_seconds / min_seconds / max_seconds：片段的理想、最短、最长时长。
+- frame_step / frame_offset：合法生成长度规则，默认对应 MiniMax 的 `5 + 17k`。
+- shot_cut_frames：可选，手动指定每个新镜头的第一帧。
+- unload models before chunk：默认开启。每段开始前卸载上一次运行留在显存中的模型，避免显存累积；显存充足时可关闭，沿用已加载的模型以加快推理。开启时节点每次都会重新执行。
+
+#### 输出说明
+
+- IMAGE / color_mask / MASK / AUDIO：当前片段的内容，长度为 `frame_count`。
+- frame_count：当前片段的生成帧数。
+- chunk_count：整段视频的片段总数。
+- shot_text：当前片段内的 `[Shot N]` 帧范围（片段内编号）及秒数，可直接拼接进提示词。
+- plan：完整分段计划，包含每段的起止帧、生成帧数、补齐帧数和镜头列表。
 
 ## Selector 使用说明
 
@@ -508,10 +549,13 @@ SAM3.1 和 SeC-4B 共用同一个 Selector 框架。两者都支持多对象；S
 #### 时间控制和锚点帧
 
 - 时间线上方的 `|<` 和 `>|` 用于逐帧移动，滑杆和帧号输入框用于快速定位。
-- 只允许一个锚点帧存在。第一次在某帧产生有效的 Mask、BBox 或 Point 后，该帧成为锚点。
-- 已存在编辑数据时切换帧，会提示“当前已存在编辑数据，切换锚点帧将自动清除，是否继续？”。确认后会清除全部对象提示和 Undo/Redo 历史。
-- 切换到新帧后，只有重新添加提示，该帧才会成为新的锚点。
-- 已经点击 `Apply to Node` 的工作流再次打开 Selector 时，会自动跳转到保存的锚点帧并恢复提示。
+- SAM3.1 支持多个锚点帧。在某帧添加有效的 Semantic、Mask、BBox 或 Point 后，该帧成为锚点；切换帧时会保留已有锚点的提示。
+- 时间线上方的蓝色标记表示锚点，橙色表示当前帧所在的锚点；点击标记或 `Anchors` 行中的帧号可跳转到该锚点。
+- `Delete Current Anchor` 清除当前帧的全部提示，使该帧不再是锚点。
+- 对象列表在所有锚点间共享：`Object 1 (Red)` 在每个锚点都代表同一个人物，对应 `color_mask` 中的同一颜色。在某个锚点删除对象，会同时从所有锚点删除该对象。
+- Undo/Redo 只作用于当前锚点，切换帧后清空。
+- SeC-4B 仍只允许一个锚点帧：已存在编辑数据时切换帧，会提示“当前已存在编辑数据，切换锚点帧将自动清除，是否继续？”，确认后清除全部对象提示和 Undo/Redo 历史。
+- 已经点击 `Apply to Node` 的工作流再次打开 Selector 时，会自动跳转到保存的（第一个）锚点帧并恢复提示。
 - `anchor_frame` 是当前输入帧批次的本地帧号。
 
 #### Draw Mask
@@ -546,6 +590,11 @@ SAM3.1 和 SeC-4B 共用同一个 Selector 框架。两者都支持多对象；S
 - `Undo` / `Redo` 撤销或恢复最近一次提示编辑。
 - `Clear All Prompt` 清除所有对象的 Mask、BBox 和 Point。
 - `Preview Current Frame` 只运行当前锚点帧的模型分割，结果用于检查提示是否合理，不会替代最终整段视频执行。
+- `Preview Current Shot`（仅 SAM3.1）：按节点的 `shot_cut_frames`、`stop_at_shot_cuts`、`propagation_direction` 设置，只跟踪当前帧所在的镜头，与正式执行使用相同的传播逻辑。需要 Selector 使用节点输入缓存（见 `wait_for_input_cache`），运行时占用 GPU，建议在工作流未执行时使用。结果包括：
+  - 逐帧面积曲线：每个 Object 一行，红色竖带标出面积明显低于该镜头常见面积的帧（常见于手脚漏抠或跟丢）；蓝色虚线为锚点，橙色线为当前帧。点击曲线跳转到对应帧。
+  - 缩略图条：在镜头内平均抽取最多 10 帧并叠加 Object 颜色，点击跳转。
+  - 逐帧叠加：在该镜头内拖动时间线或逐帧移动时，主画面直接显示跟踪结果。修改提示后标题会提示结果已过期，需要重新预览。
+  - 从锚点开始就没有抠到的部位（例如整段缺一只手）不会在曲线上形成凹陷，请先用 `Preview Current Frame` 确认锚点帧完整。
 - `Cancel` 关闭窗口并放弃本次未应用的修改。
 - `Apply to Node` 将提示数据和锚点帧写入节点。
 

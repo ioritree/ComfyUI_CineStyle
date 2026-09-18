@@ -27,6 +27,7 @@ registerVideoSelector({
     nodeId: NODE_ID,
     extensionName: "CineStyle.VideoSegmentSAM3",
     title: "SAM3.1 Video Selector",
+    multiAnchor: true,
     previewRoute: "/cinestyle/video-segment-preview",
     previewLabel: "Running SAM3.1 on this frame...",
     widgets: { prompt: "prompt_data" },
@@ -39,6 +40,17 @@ registerVideoSelector({
         frame: previewFrame,
         prompt_data: promptData,
         model_source: connectedModelSource(node),
+    }),
+    shotPreviewRoute: "/cinestyle/video-segment-shot-preview",
+    shotPreview: async ({ node, frame, promptData, fetchShotPreview }) => fetchShotPreview({
+        frame,
+        prompt_data: promptData,
+        model_source: connectedModelSource(node),
+        shot_cut_frames: String(widget(node, "shot_cut_frames")?.value ?? ""),
+        stop_at_shot_cuts: widget(node, "stop_at_shot_cuts")?.value !== false,
+        propagation_direction: String(widget(node, "propagation_direction")?.value || "both"),
+        max_objects: Number(widget(node, "max_objects")?.value || 16),
+        object_colors: String(widget(node, "object_colors")?.value ?? ""),
     }),
     apply: ({ node, frame, promptData, setWidgetValue }) => {
         setWidgetValue(node, "anchor_frame", frame);
