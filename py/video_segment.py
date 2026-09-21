@@ -403,7 +403,9 @@ def _prompt_selector_fps(prompt: Any, node_id: Any) -> float | None:
 def _video_input_fps(video_input: Any, prompt: Any = None, node_id: Any = None) -> float:
     if video_input is not None:
         try:
-            fps = float(video_input.get_components().frame_rate)
+            # get_components() decodes the whole clip to float32 just to read
+            # the rate; get_frame_rate() reads it from the container metadata.
+            fps = float(video_input.get_frame_rate())
             if math.isfinite(fps) and fps > 0:
                 return fps
         except Exception:
@@ -890,10 +892,17 @@ def _sam3_anchor_masks(model: Any, image: torch.Tensor, prompt_data: str | None)
     return torch.stack(masks, dim=0)
 
 
-def _preview_data_url(frame: torch.Tensor, mask: torch.Tensor) -> str:
+def _preview_data_url(frame: torch.Tensor, mask: torch.Tensor, masks: torch.Tensor | None = None) -> str:
     source = frame[..., :3].to("cpu", dtype=torch.float32).clamp(0.0, 1.0)
     alpha = mask.to("cpu", dtype=torch.float32).clamp(0.0, 1.0).unsqueeze(-1) * 0.52
-    color = source.new_tensor([0.20, 0.77, 0.71])
+    if masks is not None and masks.ndim == 3 and masks.shape[0] > 0:
+        # One colour per object, matching the node's color_mask output, so two
+        # people can be told apart in the preview.
+        palette = _parse_object_colors(None, int(masks.shape[0]))
+        strongest, owner = masks.to("cpu", dtype=torch.float32).max(dim=0)
+        color = palette[torch.where(strongest > 0, owner + 1, torch.zeros_like(owner))]
+    else:
+        color = source.new_tensor([0.20, 0.77, 0.71])
     composite = source * (1.0 - alpha) + color * alpha
     array = (composite * 255.0).round().to(torch.uint8).numpy()
     image = Image.fromarray(array, mode="RGB")
@@ -931,7 +940,7 @@ async def _video_segment_preview_route(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "frame": frame_index,
-                "image": _preview_data_url(frame[0], mask),
+                "image": _preview_data_url(frame[0], mask, masks),
                 "mask_area": float((mask > 0.5).float().mean().item()),
             }
         )
@@ -1854,6 +1863,75 @@ def _detect_shot_cuts(images: torch.Tensor) -> list[int]:
     return [frame for frame, _ in cuts]
 
 
+def _planner_chunk_window(prompt: Any, cuts: list[int], frame_count: int) -> tuple[tuple[int, int], str] | None:
+    """Frames of the chunk a downstream CS Shot Planner is about to render.
+
+    The planner runs after this node, so its settings are read from the prompt
+    and its plan is recomputed here.  That way one ``chunk_index`` drives both
+    nodes and only the shot being tested has to be segmented.
+    """
+    if not isinstance(prompt, dict):
+        return None
+    package = __name__.rsplit(".", 1)[0]
+    module = sys.modules.get(f"{package}._py_shot_planner")
+    planner = getattr(module, "plan_chunks", None)
+    if planner is None:
+        return None
+    node = next((item for item in prompt.values()
+                 if isinstance(item, dict) and item.get("class_type") == "CS_Shot_Planner"), None)
+    if node is None:
+        return None
+    values = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+
+    def number(name: str, fallback: float) -> float:
+        value = values.get(name, fallback)
+        if isinstance(value, (list, tuple)):  # linked input; not readable here
+            raise ValueError(
+                f"CS Shot Planner's {name} is connected to another node, so this node cannot follow it. "
+                "Set it as a widget value or use work_frame instead."
+            )
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    plan = planner(
+        frame_count, cuts, number("fps", 24.0), number("target_seconds", 8.0),
+        number("min_seconds", 4.0), number("max_seconds", 10.0),
+        int(number("frame_step", 17)), int(number("frame_offset", 5)),
+        int(number("max_shots_per_chunk", 0)),
+    )
+    chunks = plan["chunks"]
+    if not chunks:
+        return None
+    located = int(number("locate_frame", -1))
+    if located >= 0:
+        chunk = next((item for item in chunks if item["start"] <= located < item["end"]), None)
+    else:
+        index = int(number("chunk_index", 0))
+        chunk = chunks[index] if 0 <= index < len(chunks) else None
+    if chunk is None:
+        raise ValueError(f"CS Shot Planner has {len(chunks)} chunks; its current selection is out of range.")
+    return (chunk["start"], chunk["end"]), f"chunk #{chunk['index']}"
+
+
+def _parse_frame_range(value: str | None, frame_count: int) -> tuple[int, int] | None:
+    """Parse ``"448-463"`` (inclusive) into a half-open range; ``None`` = all."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = [part for part in re.split(r"[\s,;:\-]+", text) if part]
+    try:
+        numbers = [int(float(part)) for part in parts]
+    except ValueError as exc:
+        raise ValueError("frame_range must look like 448-463.") from exc
+    if not numbers:
+        return None
+    first = max(0, min(numbers[0], frame_count - 1))
+    last = max(first, min(numbers[-1] if len(numbers) > 1 else numbers[0], frame_count - 1))
+    return first, last + 1
+
+
 def _parse_cut_frames(value: str | None, frame_count: int) -> list[int] | None:
     """Parse a manual ``12, 80, 144`` cut list; ``None`` means auto-detect."""
     text = str(value or "").strip()
@@ -1874,9 +1952,13 @@ def _anchor_segments(
 ) -> list[tuple[int, int, int]]:
     """Assign every frame to at most one anchor as ``(anchor, start, end)``.
 
-    Segments never cross a shot cut.  Inside one shot, neighbouring anchors
-    split the frames between them; shots without an anchor stay empty rather
-    than inheriting a track that has drifted onto someone else.
+    Segments never cross a shot cut, and shots without an anchor stay empty
+    rather than inheriting a track that has drifted onto someone else.
+
+    With ``both``, the first anchor of a shot also fills the frames before it,
+    and every later anchor owns the frames from itself until the next one: a
+    correction made on a frame therefore applies from that frame onwards
+    instead of being split at the midpoint between two anchors.
     """
     bounds = [0, *[cut for cut in cuts if 0 < cut < frame_count], frame_count]
     segments: list[tuple[int, int, int]] = []
@@ -1890,8 +1972,8 @@ def _anchor_segments(
             elif direction == "backward":
                 start, end = (previous + 1) if previous is not None else shot_start, anchor + 1
             else:
-                start = (previous + anchor + 1) // 2 if previous is not None else shot_start
-                end = (anchor + following + 1) // 2 if following is not None else shot_end
+                start = shot_start if previous is None else anchor
+                end = shot_end if following is None else following
             segments.append((anchor, start, end))
     return segments
 
@@ -2068,6 +2150,37 @@ class CSVideoSegmentSAM3(io.ComfyNode):
                         "placed inside it; shots without an anchor produce an empty mask."
                     ),
                 ),
+                io.Boolean.Input(
+                    "follow_planner_chunk",
+                    display_name="only segment the planner's chunk",
+                    default=False,
+                    tooltip=(
+                        "Testing switch: segment only the frames of the chunk that a downstream "
+                        "CS Shot Planner will render, and leave the rest of the mask empty. Turn it off "
+                        "for the final run."
+                    ),
+                ),
+                io.Int.Input(
+                    "work_frame",
+                    default=-1,
+                    min=-1,
+                    max=100000000,
+                    step=1,
+                    tooltip=(
+                        "Testing shortcut: process only the shot that contains this frame and leave the rest "
+                        "of the mask empty. -1 processes the whole video. Link it to the Shot Planner's "
+                        "locate_frame so one number drives both."
+                    ),
+                ),
+                io.String.Input(
+                    "frame_range",
+                    default="",
+                    advanced=True,
+                    tooltip=(
+                        "Testing shortcut: segment only these frames, e.g. 448-463, and leave the rest of "
+                        "the mask empty. Empty processes the whole video. Clear it before the final run."
+                    ),
+                ),
                 io.String.Input(
                     "shot_cut_frames",
                     default="",
@@ -2104,6 +2217,13 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         )
 
     @classmethod
+    def fingerprint_inputs(cls, **kwargs: Any) -> Any:
+        # The processed window comes from the planner's chunk_index, which is
+        # not an input of this node, so a cached mask would belong to whichever
+        # chunk ran last.
+        return float("nan") if kwargs.get("follow_planner_chunk", False) else None
+
+    @classmethod
     def execute(
         cls,
         model: Any,
@@ -2114,6 +2234,9 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         propagation_direction: str = "both",
         max_objects: int = 16,
         stop_at_shot_cuts: bool = True,
+        follow_planner_chunk: bool = False,
+        work_frame: int = -1,
+        frame_range: str = "",
         shot_cut_frames: str = "",
         object_colors: str = "",
         wait_for_input_cache: bool = False,
@@ -2184,6 +2307,36 @@ class CSVideoSegmentSAM3(io.ComfyNode):
             cuts = manual_cuts if manual_cuts is not None else _detect_shot_cuts(images)
             _segment_info(node_name, f"{'manual' if manual_cuts is not None else 'detected'} shot cuts: {cuts}")
         segments = _anchor_segments(anchor_frames, cuts, frame_count, propagation_direction)
+        window = _parse_frame_range(frame_range, frame_count)
+        if window is None and bool(follow_planner_chunk):
+            found = _planner_chunk_window(cls.hidden.prompt, cuts, frame_count)
+            if found is None:
+                raise ValueError("No CS Shot Planner was found downstream, so follow_planner_chunk has nothing to follow.")
+            window, label = found
+            _segment_info(node_name, f"follow_planner_chunk: {label} covers frames {window[0]}-{window[1] - 1}")
+        if window is None and int(work_frame) >= 0:
+            target = min(max(0, int(work_frame)), frame_count - 1)
+            bounds = [0, *[cut for cut in cuts if 0 < cut < frame_count], frame_count]
+            window = (
+                max(value for value in bounds[:-1] if value <= target),
+                min(value for value in bounds[1:] if value > target),
+            )
+            _segment_info(node_name, f"work_frame {target} selects shot {window[0]}-{window[1] - 1}")
+        if window is not None:
+            low, high = window
+            segments = [
+                (anchor, max(start, low), min(end, high))
+                for anchor, start, end in segments
+                if low <= anchor < high
+            ]
+            segments = [item for item in segments if item[2] > item[1]]
+            _segment_info(
+                node_name,
+                f"frame_range limits processing to {low}-{high - 1}; segments={len(segments)} "
+                "(the rest of the mask stays empty)",
+            )
+            if not segments:
+                raise ValueError(f"No anchor lies inside frame_range {low}-{high - 1}.")
         empty_shots = [
             [start, end]
             for start, end in zip([0, *cuts], [*cuts, frame_count])
@@ -2192,8 +2345,11 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         if empty_shots:
             _segment_info(node_name, f"shots without an anchor (empty mask): {empty_shots}")
 
-        union = torch.zeros(frame_count, height, width, dtype=torch.float32)
-        labels = torch.zeros(frame_count, height, width, dtype=torch.uint8)
+        # ``torch.zeros`` memsets, so every page is committed even when only one
+        # chunk is tracked.  ``np.zeros`` hands back demand-zero pages, keeping
+        # the untouched frames of a long video out of the working set.
+        union = torch.from_numpy(np.zeros((frame_count, height, width), dtype=np.float32))
+        labels = torch.from_numpy(np.zeros((frame_count, height, width), dtype=np.uint8))
         progress_total = max(1, sum((end - anchor if end - anchor > 1 else 0) + (anchor - start + 1 if anchor > start else 0) for anchor, start, end in segments))
         backend_pbar = comfy.utils.ProgressBar(progress_total)
         _segment_info(
@@ -2208,12 +2364,13 @@ class CSVideoSegmentSAM3(io.ComfyNode):
         finally:
             nested_tqdm.stop()
             pbar.close()
-        union.clamp_(0.0, 1.0)
+        low, high = window if window is not None else (0, frame_count)
+        union[low:high].clamp_(0.0, 1.0)
 
         palette = _parse_object_colors(object_colors, object_count)
-        color_mask = torch.empty(frame_count, height, width, 3, dtype=torch.float32)
-        for start in range(0, frame_count, 32):
-            end = min(frame_count, start + 32)
+        color_mask = torch.from_numpy(np.zeros((frame_count, height, width, 3), dtype=np.float32))
+        for start in range(low, high, 32):
+            end = min(high, start + 32)
             color_mask[start:end] = palette[labels[start:end].long()] * union[start:end, ..., None]
         del labels
 
@@ -2229,6 +2386,10 @@ class CSVideoSegmentSAM3(io.ComfyNode):
             "object_count": object_count,
             "object_colors": ["#%02X%02X%02X" % tuple(round(float(v) * 255) for v in row) for row in palette[1:]],
             "stop_at_shot_cuts": bool(stop_at_shot_cuts),
+            # Downstream nodes (the Shot Planner) follow this while testing a
+            # single shot, so only one field has to be set.
+            "work_frame": int(work_frame),
+            "frame_window": list(window) if window is not None else None,
             "shot_cuts": cuts,
             "segments": [{"anchor": anchor, "start": start, "end": end} for anchor, start, end in segments],
         }
@@ -2238,6 +2399,9 @@ class CSVideoSegmentSAM3(io.ComfyNode):
 
 _SHOT_PREVIEW_CUT_CACHE: dict[str, list[int]] = {}
 _SHOT_PREVIEW_LOCK = threading.Lock()
+# Per-object labels of the last shot preview, so a frame of that track can be
+# adopted as a Selector prompt and corrected by hand.
+_SHOT_PREVIEW_TRACK: dict[str, Any] = {}
 
 
 def _selector_frame_batch(payload: dict[str, Any]) -> np.ndarray:
@@ -2378,6 +2542,17 @@ def _shot_preview(payload: dict[str, Any]) -> dict[str, Any]:
         mixed = source * (1.0 - alpha) + palette[small_labels] * alpha
         thumbs.append({"frame": start + step, "image": _encode_jpeg((mixed * 255.0).round().clamp(0, 255).to(torch.uint8).numpy())})
 
+    with _SHOT_PREVIEW_LOCK:
+        _SHOT_PREVIEW_TRACK.clear()
+        _SHOT_PREVIEW_TRACK.update({
+            "start": start,
+            "end": end,
+            "object_count": object_count,
+            "labels": labels,
+            "height": height,
+            "width": width,
+        })
+
     return {
         "start": start,
         "end": end,
@@ -2389,6 +2564,44 @@ def _shot_preview(payload: dict[str, Any]) -> dict[str, Any]:
         "overlays": overlays,
         "thumbs": thumbs,
     }
+
+
+def _tracked_frame_masks(frame: int) -> dict[str, Any]:
+    """Return the last shot preview's per-object mask for one frame as PNGs."""
+    with _SHOT_PREVIEW_LOCK:
+        track = dict(_SHOT_PREVIEW_TRACK)
+    labels = track.get("labels")
+    if labels is None:
+        raise ValueError("Run Preview Current Shot first, then adopt one of its frames.")
+    start, end = int(track["start"]), int(track["end"])
+    if not start <= frame < end:
+        raise ValueError(f"Frame {frame} is outside the tracked shot {start}-{end - 1}.")
+    step = labels[frame - start]
+    objects = []
+    for index in range(1, int(track["object_count"]) + 1):
+        present = step == index
+        if not bool(present.any()):
+            continue
+        rgba = torch.zeros(*present.shape, 4, dtype=torch.uint8)
+        rgba[..., :3] = 255
+        rgba[..., 3] = present.to(torch.uint8) * 255
+        objects.append({
+            "index": index,
+            "area": round(float(present.float().mean()), 5),
+            "mask": _encode_png(rgba.numpy(), "RGBA"),
+        })
+    if not objects:
+        raise ValueError(f"No tracked object covers frame {frame}.")
+    return {"frame": frame, "start": start, "end": end, "width": int(track["width"]), "height": int(track["height"]), "objects": objects}
+
+
+async def _video_segment_shot_mask_route(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+        result = await asyncio.to_thread(_tracked_frame_masks, int(payload.get("frame", 0)))
+        return web.json_response(result)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
 
 
 async def _video_segment_shot_preview_route(request: web.Request) -> web.Response:
@@ -2420,6 +2633,9 @@ class VideoSegmentExtension(ComfyExtension):
             )
             server_instance.routes.post("/cinestyle/video-segment-shot-preview")(
                 _video_segment_shot_preview_route
+            )
+            server_instance.routes.post("/cinestyle/video-segment-shot-mask")(
+                _video_segment_shot_mask_route
             )
             server_instance.routes.get("/cinestyle/sec-models")(
                 _sec_video_segment_models_route

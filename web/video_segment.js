@@ -42,6 +42,7 @@ registerVideoSelector({
         model_source: connectedModelSource(node),
     }),
     shotPreviewRoute: "/cinestyle/video-segment-shot-preview",
+    shotMaskRoute: "/cinestyle/video-segment-shot-mask",
     shotPreview: async ({ node, frame, promptData, fetchShotPreview }) => fetchShotPreview({
         frame,
         prompt_data: promptData,
