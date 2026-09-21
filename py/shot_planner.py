@@ -194,49 +194,126 @@ _COLOR_NAMES = {
 }
 
 
-def _present_objects(color_chunk: torch.Tensor, colors: list[str]) -> list[int]:
-    """Return the 1-based objects whose colour actually appears in the chunk.
+def _present_objects(color_chunk: torch.Tensor, colors: list[str]) -> list[dict[str, Any]]:
+    """Measure how much of the chunk each coloured object actually covers.
 
-    A chunk that covers only part of the video usually contains a subset of the
-    tracked people.  Telling the prompt which ones are present stops the video
-    model from pulling in a reference image for somebody who is not there.
+    A person can be the subject of the shot, or a leg swinging through the
+    frame for a few frames.  The prompt needs that difference: describing the
+    full appearance of someone who is only partly visible makes the video model
+    render the whole person.
     """
     if not isinstance(color_chunk, torch.Tensor) or color_chunk.ndim != 4 or not colors:
         return []
-    sample = color_chunk[:: max(1, int(color_chunk.shape[0]) // 24 or 1)].float()
-    sample = sample.reshape(-1, 3) if sample.shape[-1] == 3 else sample[..., :3].reshape(-1, 3)
-    lit = sample[sample.amax(dim=1) > 0.15]
-    if not lit.numel():
-        return []
-    present: list[int] = []
-    total = float(lit.shape[0])
+    # Sides are decided per shot, so a chunk of several shots needs enough
+    # samples for the shortest one to still be measurable.
+    stride = max(1, int(color_chunk.shape[0]) // 48)
+    sample = color_chunk[::stride, ..., :3].float()
+    frames = int(sample.shape[0])
+    pixels = float(sample.shape[1] * sample.shape[2])
+    present: list[dict[str, Any]] = []
     for index, value in enumerate(colors, start=1):
         text = str(value).lstrip("#")
         if len(text) != 6:
             continue
         target = torch.tensor([int(text[offset : offset + 2], 16) / 255.0 for offset in (0, 2, 4)])
-        close = ((lit - target).abs().amax(dim=1) < 0.30).sum().item()
-        if close / total > 0.02:
-            present.append(index)
+        hit = ((sample - target).abs().amax(dim=-1) < 0.30) & (sample.amax(dim=-1) > 0.15)
+        per_frame = hit.flatten(1).sum(dim=1) / pixels
+        seen = int((per_frame > 0.002).sum())
+        if not seen:
+            continue
+        columns = hit.sum(dim=1).float()
+        axis = torch.arange(columns.shape[1], dtype=torch.float32) + 0.5
+        centre = (columns * axis).sum(dim=1) / columns.sum(dim=1).clamp(min=1.0) / columns.shape[1]
+        present.append({
+            "index": index,
+            "mean": round(float(per_frame.mean()) * 100, 1),
+            "active": round(float(per_frame[per_frame > 0.002].mean()) * 100, 1),
+            "peak": round(float(per_frame.max()) * 100, 1),
+            "frames_seen": seen,
+            "frames": frames,
+            "step": stride,
+            "seen": (per_frame > 0.002).tolist(),
+            "centres": [round(float(value), 3) for value in centre],
+        })
     return present
 
 
-def _presence_text(present: list[int], colors: list[str]) -> str:
-    def describe(index: int) -> str:
+def _sides(present: list[dict[str, Any]], start: int = 0, end: int = 1 << 30) -> list[str]:
+    """Name the half of the frame each mask keeps to, or nothing for anybody.
+
+    The colour mapping alone lets the video model drift between the two
+    reference pictures, so the prompt also says which side each mask is on.
+    With two people the claim is relative, so it is decided by their order in
+    every frame where both appear: fighters at close range sit either side of
+    the middle without ever crossing.  One person alone has no order to test
+    and is placed against the middle instead.
+    """
+    blank = [""] * len(present)
+
+    def inside(item: dict[str, Any], index: int) -> bool:
+        return start <= index * int(item["step"]) < end
+
+    if len(present) == 2:
+        first, second = present
+        pairs = [
+            (left, right)
+            for index, (left, right) in enumerate(zip(first["centres"], second["centres"]))
+            if first["seen"][index] and second["seen"][index] and inside(first, index)
+        ]
+        if not pairs:
+            return blank
+        if all(left + 0.05 < right for left, right in pairs):
+            return ["畫面左側", "畫面右側"]
+        if all(right + 0.05 < left for left, right in pairs):
+            return ["畫面右側", "畫面左側"]
+        return blank
+    if len(present) == 1:
+        item = present[0]
+        centres = [value for index, value in enumerate(item["centres"]) if item["seen"][index] and inside(item, index)]
+        if not centres:
+            return blank
+        if max(centres) < 0.40:
+            return ["畫面左側"]
+        if min(centres) > 0.60:
+            return ["畫面右側"]
+    return blank
+
+
+def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bool = False) -> str:
+    def describe(item: dict[str, Any]) -> str:
+        index = int(item["index"])
         code = str(colors[index - 1]).upper() if index - 1 < len(colors) else ""
-        return f"{_COLOR_NAMES.get(code, code)}（{code}）→ <Picture {index}>"
+        ratio = item["frames_seen"] / max(1, item["frames"])
+        # Size and duration are separate: a figure that fills a fifth of the
+        # frame and then walks out is a real character, not a fragment.
+        if item["active"] < 8.0:
+            role = (
+                f"僅局部入鏡（出現時平均佔畫面 {item['active']}%，出現於 {item['frames_seen']}/{item['frames']} 取樣幀）"
+                "，只描述可見部位，不要描述看不到的臉、髮型或服裝整體，也不要生成完整人物"
+            )
+        elif ratio < 0.7:
+            role = (
+                f"只出現於本段的 {item['frames_seen']}/{item['frames']} 取樣幀（出現時平均佔畫面 {item['active']}%）"
+                "，出現期間是完整人物，必須完整替換；離開畫面後不要再補出這個人"
+            )
+        else:
+            role = f"本段主要角色（平均佔畫面 {item['mean']}%）"
+        return f"{_COLOR_NAMES.get(code, code)}（{code}）→ <Picture {index}>：{role}"
 
     if not present:
         return ""
-    missing = [index for index in range(1, len(colors) + 1) if index not in present]
-    line = "本段只出現：" + "、".join(describe(index) for index in present)
+    indices = [int(item["index"]) for item in present]
+    missing = [index for index in range(1, len(colors) + 1) if index not in indices]
+    line = "本段出現的人物：\n- " + "\n- ".join(describe(item) for item in present)
     if missing:
-        line += "。本段沒有出現 " + "、".join(
+        line += "\n本段沒有出現 " + "、".join(
             f"<Picture {index}>" + (f"（{_COLOR_NAMES.get(str(colors[index - 1]).upper(), '')}）" if index - 1 < len(colors) else "")
             for index in missing
         ) + " 的人物，請完全不要使用這些參考圖，也不要憑空加入該人物。"
+    elif located:
+        line += "\n每個鏡頭的左右方位已標在該鏡頭那一行，請依遮罩顏色與該鏡頭的方位對應參考圖，兩人的對應關係不可互換。"
     else:
-        line += "。兩人的對應關係不可互換。"
+        line += "\n兩人的對應關係不可互換。"
     return line
 
 
@@ -244,32 +321,53 @@ def _format_seconds(frames: int, fps: float) -> str:
     return f"{frames / fps:.2f}s"
 
 
-def _shot_text(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool = True, presence: str = "") -> str:
-    """Describe the chunk's shots with chunk-local frame numbers."""
+def _shot_text(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool = True,
+               present: list[dict[str, Any]] | None = None, colors: list[str] | None = None) -> str:
+    """Describe the chunk's shots with chunk-local frame numbers.
+
+    Sides are decided per shot: across a cut the two people often swap halves,
+    so one side for the whole chunk would be wrong for some of its shots and
+    the prompt model would fill the gap with its own guess.
+    """
+    present = present or []
+    colors = colors or []
     start = chunk["start"]
+    located = False
     lines = []
     for number, (shot_start, shot_end) in enumerate(chunk["shots"], start=1):
         local_start, local_end = shot_start - start, shot_end - start - 1
-        lines.append(
-            f"[Shot {number}] {local_start}–{local_end} 幀（{_format_seconds(local_start, fps)}–{_format_seconds(local_end + 1, fps)}）"
-        )
-    if chunk["extra_frames"] > 0 and freeze:
+        line = f"[Shot {number}] {local_start}–{local_end} 幀（{_format_seconds(local_start, fps)}–{_format_seconds(local_end + 1, fps)}）"
+        sides = _sides(present, local_start, local_end + 1)
+        named = [
+            f"{_COLOR_NAMES.get(str(colors[item['index'] - 1]).upper(), '')}在{side}"
+            for item, side in zip(present, sides)
+            if side and item["index"] - 1 < len(colors)
+        ]
+        if named:
+            line += "：" + "、".join(named)
+            located = True
+        lines.append(line)
+    padding = ""
+    if chunk["extra_frames"] > 0:
         local_start = chunk["frames"]
         local_end = chunk["generation_frames"] - 1
-        lines.append(
-            f"[Shot {len(chunk['shots']) + 1}] {local_start}–{local_end} 幀"
-            f"（靜止補齊幀，畫面停在前一幀，生成後會裁掉）"
-        )
-    elif chunk["extra_frames"] > 0:
-        local_start = chunk["frames"]
-        local_end = chunk["generation_frames"] - 1
-        filler = (
-            "下一個鏡頭的開頭，僅為湊足生成幀數，生成後會裁掉"
-            if chunk["end"] < frame_count
-            else "重複最後一幀補齊，生成後會裁掉"
-        )
-        lines.append(f"[Shot {len(chunk['shots']) + 1}] {local_start}–{local_end} 幀（{filler}）")
+        if not freeze and chunk["end"] < frame_count:
+            lines.append(
+                f"[Shot {len(chunk['shots']) + 1}] {local_start}–{local_end} 幀"
+                f"（下一個鏡頭的開頭，僅為湊足生成幀數，生成後會裁掉）"
+            )
+        else:
+            # Numbering this as a Shot makes the prompt model write it up as a
+            # cut and invent a new framing, which loses the character binding.
+            held = "畫面停在第" if freeze else "重複第"
+            padding = (
+                f"（{local_start}–{local_end} 幀為補齊幀，{held} {local_start - 1} 幀不動，"
+                "沒有換鏡頭、沒有改變構圖或人物，生成後會裁掉）"
+            )
     text = "；\n".join(lines) + f"\n（{fps:g}fps，共 {chunk['generation_frames']} 幀）"
+    if padding:
+        text += "\n" + padding
+    presence = _presence_text(present, colors, located)
     if presence:
         text += "\n" + presence
     return text
@@ -307,6 +405,18 @@ class CSShotPlanner(io.ComfyNode):
                 io.Float.Input("max_seconds", default=10.0, min=0.5, max=60.0, step=0.1, tooltip="Hard limit before rounding to legal generation frames. A shot longer than this is split inside the shot."),
                 io.Int.Input("frame_step", default=17, min=1, max=512, step=1, advanced=True, tooltip="Legal generation length is frame_offset + k * frame_step. MiniMax: 17."),
                 io.Int.Input("frame_offset", default=5, min=0, max=512, step=1, advanced=True, tooltip="Legal generation length is frame_offset + k * frame_step. MiniMax: 5."),
+                io.Int.Input(
+                    "locate_frame",
+                    default=-1,
+                    min=-1,
+                    max=100000000,
+                    step=1,
+                    tooltip=(
+                        "Render the chunk that contains this source frame and ignore chunk_index. "
+                        "-1 follows video_info.work_frame from CS Video Segment (SAM3.1), and falls "
+                        "back to chunk_index when that is -1 too."
+                    ),
+                ),
                 io.Int.Input(
                     "max_shots_per_chunk",
                     default=0,
@@ -370,6 +480,7 @@ class CSShotPlanner(io.ComfyNode):
         max_seconds: float = 10.0,
         frame_step: int = 17,
         frame_offset: int = 5,
+        locate_frame: int = -1,
         max_shots_per_chunk: int = 0,
         padding: str = "freeze last frame",
         shot_cut_frames: str = "",
@@ -408,6 +519,23 @@ class CSShotPlanner(io.ComfyNode):
         plan["padding"] = str(padding)
         chunk_count = len(plan["chunks"])
         index = int(chunk_index)
+        located = int(locate_frame)
+        if located < 0 and isinstance(video_info, dict):
+            # CS Video Segment (SAM3.1) exposes the shot it is testing; follow it
+            # so a single field drives both nodes.
+            inherited = int(video_info.get("work_frame", -1) or -1)
+            if inherited >= 0:
+                located = inherited
+                _LOGGER.info("[CS Shot Planner] following video_info.work_frame %d", located)
+        if located >= 0:
+            match = next((item for item in plan["chunks"] if item["start"] <= located < item["end"]), None)
+            if match is None:
+                raise ValueError(f"locate_frame {located} is outside 0..{frame_count - 1}.")
+            index = int(match["index"])
+            _LOGGER.info(
+                "[CS Shot Planner] frame %d is in chunk #%d (%d-%d); chunk_index %s ignored",
+                located, index, match["start"], match["end"] - 1, chunk_index,
+            )
         if not 0 <= index < chunk_count:
             raise ValueError(
                 f"chunk_index {index} is out of range: this video has {chunk_count} chunks (0..{chunk_count - 1}). "
@@ -456,7 +584,13 @@ class CSShotPlanner(io.ComfyNode):
         present = _present_objects(chunk_color, colors)
         chunk["objects_present"] = present
         plan["objects_present"] = present
+        if present:
+            _LOGGER.info(
+                "[CS Shot Planner] chunk %d coverage: %s", index,
+                ", ".join(f"Object {item['index']} mean {item['mean']}% seen {item['frames_seen']}/{item['frames']}" for item in present),
+            )
         plan["chunk_index"] = index
+        plan["locate_frame"] = located
         return io.NodeOutput(
             chunk_images,
             chunk_color,
@@ -464,7 +598,7 @@ class CSShotPlanner(io.ComfyNode):
             chunk_audio,
             length,
             chunk_count,
-            _shot_text(chunk, float(fps), frame_count, freeze, _presence_text(present, colors)),
+            _shot_text(chunk, float(fps), frame_count, freeze, present, colors),
             plan,
         )
 
