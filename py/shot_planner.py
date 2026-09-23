@@ -218,21 +218,30 @@ def _present_objects(color_chunk: torch.Tensor, colors: list[str]) -> list[dict[
         target = torch.tensor([int(text[offset : offset + 2], 16) / 255.0 for offset in (0, 2, 4)])
         hit = ((sample - target).abs().amax(dim=-1) < 0.30) & (sample.amax(dim=-1) > 0.15)
         per_frame = hit.flatten(1).sum(dim=1) / pixels
-        seen = int((per_frame > 0.002).sum())
+        visible = per_frame > 0.002
+        seen = int(visible.sum())
         if not seen:
             continue
+        # A limb swinging into view is cut by the frame edge; a whole person
+        # far from the camera is small too but stays inside the frame.
+        band = max(1, round(min(hit.shape[1], hit.shape[2]) * 0.01))
+        edge = (
+            hit[:, :band].flatten(1).any(dim=1) | hit[:, -band:].flatten(1).any(dim=1)
+            | hit[:, :, :band].flatten(1).any(dim=1) | hit[:, :, -band:].flatten(1).any(dim=1)
+        )
         columns = hit.sum(dim=1).float()
         axis = torch.arange(columns.shape[1], dtype=torch.float32) + 0.5
         centre = (columns * axis).sum(dim=1) / columns.sum(dim=1).clamp(min=1.0) / columns.shape[1]
         present.append({
             "index": index,
             "mean": round(float(per_frame.mean()) * 100, 1),
-            "active": round(float(per_frame[per_frame > 0.002].mean()) * 100, 1),
+            "active": round(float(per_frame[visible].mean()) * 100, 1),
+            "cut_off": round(int((edge & visible).sum()) / seen, 2),
             "peak": round(float(per_frame.max()) * 100, 1),
             "frames_seen": seen,
             "frames": frames,
             "step": stride,
-            "seen": (per_frame > 0.002).tolist(),
+            "seen": visible.tolist(),
             "centres": [round(float(value), 3) for value in centre],
         })
     return present
@@ -286,7 +295,7 @@ def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bo
         ratio = item["frames_seen"] / max(1, item["frames"])
         # Size and duration are separate: a figure that fills a fifth of the
         # frame and then walks out is a real character, not a fragment.
-        if item["active"] < 8.0:
+        if item["active"] < 8.0 and item["cut_off"] >= 0.5:
             role = (
                 f"僅局部入鏡（出現時平均佔畫面 {item['active']}%，出現於 {item['frames_seen']}/{item['frames']} 取樣幀）"
                 "，只描述可見部位，不要描述看不到的臉、髮型或服裝整體，也不要生成完整人物"
@@ -295,6 +304,11 @@ def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bo
             role = (
                 f"只出現於本段的 {item['frames_seen']}/{item['frames']} 取樣幀（出現時平均佔畫面 {item['active']}%）"
                 "，出現期間是完整人物，必須完整替換；離開畫面後不要再補出這個人"
+            )
+        elif item["active"] < 8.0:
+            role = (
+                f"本段主要角色，位於遠景（出現時平均佔畫面 {item['active']}%），畫面中是完整人物，"
+                "必須完整替換臉部、髮型與服裝"
             )
         else:
             role = f"本段主要角色（平均佔畫面 {item['mean']}%）"
@@ -310,6 +324,9 @@ def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bo
             f"<Picture {index}>" + (f"（{_COLOR_NAMES.get(str(colors[index - 1]).upper(), '')}）" if index - 1 < len(colors) else "")
             for index in missing
         ) + " 的人物，請完全不要使用這些參考圖，也不要憑空加入該人物。"
+    elif len(present) < 2:
+        if located:
+            line += "\n每個鏡頭的左右方位已標在該鏡頭那一行。"
     elif located:
         line += "\n每個鏡頭的左右方位已標在該鏡頭那一行，請依遮罩顏色與該鏡頭的方位對應參考圖，兩人的對應關係不可互換。"
     else:
