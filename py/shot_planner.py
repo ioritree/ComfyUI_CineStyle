@@ -10,16 +10,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import sys
 from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import torch
 from comfy_api.latest import ComfyExtension, io
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
 from typing_extensions import override
 
 import comfy.model_management
+import folder_paths
 
 
 _CATEGORY = "😺dzNodes/CineStyle/Video"
@@ -89,11 +93,16 @@ def plan_chunks(
     frame_step: int,
     frame_offset: int,
     max_shots: int = 0,
+    overlap: int = 0,
 ) -> dict[str, Any]:
-    """Pack shots into chunks close to ``target_seconds`` with dynamic programming."""
+    """Pack shots into chunks close to ``target_seconds`` with dynamic programming.
+
+    A chunk that starts inside a shot re-generates ``overlap`` frames of the
+    previous chunk as its ``lead``, so the seam can be anchored on them.
+    """
     max_frames = max(1, int(math.floor(max_seconds * fps)))
     shot_bounds = [0, *[cut for cut in cuts if 0 < cut < frame_count], frame_count]
-    bounds = _split_long_shots(shot_bounds, max_frames)
+    bounds = _split_long_shots(shot_bounds, max(1, max_frames - overlap))
     split_inside_shots = len(bounds) != len(shot_bounds)
 
     shot_edges = set(shot_bounds)
@@ -103,6 +112,10 @@ def plan_chunks(
             length = bounds[end_index] - bounds[start_index]
             if length > max_frames:
                 break
+            if bounds[start_index] not in shot_edges:
+                length += overlap
+                if length > max_frames:
+                    continue
             if max_shots > 0:
                 # A generated clip that contains a cut lets the video model lose
                 # track of who is who, so the number of shots can be capped.
@@ -126,9 +139,11 @@ def plan_chunks(
     chunks = []
     for index, (start, end) in enumerate(best[len(bounds) - 1][1]):
         length = end - start
-        generation = _generation_length(length, frame_step, frame_offset)
+        continues = start not in shot_edges
+        lead = overlap if continues else 0
+        generation = _generation_length(length + lead, frame_step, frame_offset)
         shots = [
-            [max(start, shot_start), min(end, shot_end)]
+            [max(start - lead, shot_start), min(end, shot_end)]
             for shot_start, shot_end in zip(shot_bounds[:-1], shot_bounds[1:])
             if shot_start < end and shot_end > start
         ]
@@ -137,14 +152,17 @@ def plan_chunks(
             "start": start,
             "end": end,
             "frames": length,
+            "continues": continues,
+            "lead": lead,
             "generation_frames": generation,
-            "extra_frames": generation - length,
+            "extra_frames": generation - length - lead,
             "shots": shots,
         })
     return {
         "frame_count": frame_count,
         "fps": fps,
         "max_shots": max_shots,
+        "overlap": overlap,
         "cuts": [cut for cut in cuts if 0 < cut < frame_count],
         "split_inside_shots": split_inside_shots,
         "target_seconds": target_seconds,
@@ -348,7 +366,8 @@ def _shot_text(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool
     """
     present = present or []
     colors = colors or []
-    start = chunk["start"]
+    # Lead frames belong to the first shot, so they are numbered as part of it.
+    start = chunk["start"] - chunk["lead"]
     located = False
     lines = []
     for number, (shot_start, shot_end) in enumerate(chunk["shots"], start=1):
@@ -366,7 +385,7 @@ def _shot_text(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool
         lines.append(line)
     padding = ""
     if chunk["extra_frames"] > 0:
-        local_start = chunk["frames"]
+        local_start = chunk["lead"] + chunk["frames"]
         local_end = chunk["generation_frames"] - 1
         if not freeze and chunk["end"] < frame_count:
             lines.append(
@@ -454,7 +473,7 @@ class CSShotPlanner(io.ComfyNode):
                         "last frame keeps the chunk inside one shot; borrowing the next shot puts a cut in it."
                     ),
                 ),
-                io.String.Input("shot_cut_frames", default="", optional=True, tooltip="Optional first frames of each new shot. Empty uses video_info.shot_cuts, then automatic detection."),
+                io.String.Input("shot_cut_frames", default="", optional=True, tooltip="Optional first frames of each new shot. Empty uses video_info.shot_cuts, then automatic detection. 0 means one continuous shot, split only by max_seconds."),
                 io.Dict.Input("video_info", optional=True, tooltip="video_info from CS Video Segment (SAM3.1); its shot_cuts are reused."),
                 io.Image.Input("color_mask", optional=True, tooltip="color_mask from CS Video Segment (SAM3.1), sliced like images."),
                 io.Mask.Input("mask", optional=True, tooltip="Optional MASK batch, sliced like images."),
@@ -466,6 +485,18 @@ class CSShotPlanner(io.ComfyNode):
                     tooltip=(
                         "Unload models left in VRAM by the previous run before this chunk. Disable to keep "
                         "models loaded for faster runs when VRAM allows."
+                    ),
+                ),
+                io.Int.Input(
+                    "seam_overlap",
+                    default=0,
+                    min=0,
+                    max=64,
+                    step=1,
+                    tooltip=(
+                        "Frames of the previous chunk re-generated at the start of a chunk that continues the "
+                        "same shot, anchored by CS Seam Guide and trimmed when assembling. 5 carries texture and "
+                        "motion across the seam; 0 anchors a single frame. Chunks that start on a cut get none."
                     ),
                 ),
             ],
@@ -499,6 +530,7 @@ class CSShotPlanner(io.ComfyNode):
         frame_offset: int = 5,
         locate_frame: int = -1,
         max_shots_per_chunk: int = 0,
+        seam_overlap: int = 0,
         padding: str = "freeze last frame",
         shot_cut_frames: str = "",
         video_info: dict[str, Any] | None = None,
@@ -531,6 +563,7 @@ class CSShotPlanner(io.ComfyNode):
         plan = plan_chunks(
             frame_count, cuts, float(fps), float(target_seconds), float(min_seconds), float(max_seconds),
             int(frame_step), int(frame_offset), max(0, int(max_shots_per_chunk)),
+            overlap=max(0, int(seam_overlap)),
         )
         plan["cut_source"] = cut_source
         plan["padding"] = str(padding)
@@ -559,7 +592,7 @@ class CSShotPlanner(io.ComfyNode):
                 "Reset chunk_index to 0."
             )
         chunk = plan["chunks"][index]
-        start, length = chunk["start"], chunk["generation_frames"]
+        start, length = chunk["start"] - chunk["lead"], chunk["generation_frames"]
         summary = ", ".join(
             f"#{item['index']} {item['start']}-{item['end'] - 1} ({item['frames'] / fps:.2f}s→{item['generation_frames']}f)"
             for item in plan["chunks"]
@@ -620,10 +653,129 @@ class CSShotPlanner(io.ComfyNode):
         )
 
 
+def _seam_dir() -> str:
+    return os.path.join(folder_paths.get_output_directory(), "cs_seams")
+
+
+def _seam_path(plan: dict[str, Any], index: int) -> str:
+    """Seam file of one chunk; the name ties it to this video's chunk layout."""
+    chunk = plan["chunks"][index]
+    return os.path.join(_seam_dir(), f"seam_{plan['frame_count']}f_{chunk['start']}-{chunk['end']}.npy")
+
+
+class CSSeamSave(io.ComfyNode):
+    """Store the last real frames of a generated chunk for the next chunk's CS Seam Guide."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="CS_Seam_Save",
+            display_name="CS Seam Save",
+            category=_CATEGORY,
+            description=(
+                "Save the last frames of this chunk, before the padding frames, so the next chunk's "
+                "CS Seam Guide can start from them."
+            ),
+            inputs=[
+                io.Image.Input("images", tooltip="Decoded frames of the generated chunk, before upscaling."),
+                io.Dict.Input("plan", tooltip="plan from CS Shot Planner."),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, images: torch.Tensor, plan: dict[str, Any]) -> io.NodeOutput:
+        index = int(plan["chunk_index"])
+        chunk = plan["chunks"][index]
+        end = int(chunk["lead"]) + int(chunk["frames"])
+        count = min(max(1, int(plan["overlap"])), end)
+        if images.shape[0] < end:
+            raise ValueError(f"images has {images.shape[0]} frames; chunk {index} needs {end}.")
+        path = _seam_path(plan, index)
+        os.makedirs(_seam_dir(), exist_ok=True)
+        np.save(path, (images[end - count : end, ..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy())
+        _LOGGER.info("[CS Seam Save] chunk %d frames %d-%d -> %s", index, end - count, end - 1, path)
+        return io.NodeOutput()
+
+
+class CSSeamGuide(io.ComfyNode):
+    """Anchor the previous chunk's last frames at this chunk's start so chunks join without a jump."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="CS_Seam_Guide",
+            display_name="CS Seam Guide",
+            category=_CATEGORY,
+            description=(
+                "Start this chunk from the frames CS Seam Save stored for the previous chunk. Chunk 0, a "
+                "chunk that starts on a cut, or one whose previous seam was never saved passes through unchanged."
+            ),
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Latent.Input("latent", tooltip="LATENT from MiniMax H3 Reference to Video."),
+                io.Vae.Input("vae", tooltip="MiniMax H3 video VAE."),
+                io.Dict.Input("plan", tooltip="plan from CS Shot Planner."),
+                io.Boolean.Input("enabled", default=True),
+                io.Image.Input(
+                    "seam_image",
+                    optional=True,
+                    tooltip=(
+                        "Use these frames instead of the saved seam, e.g. the last frames of an earlier take you "
+                        "prefer. The last frame lines up with the frame before this chunk."
+                    ),
+                ),
+            ],
+            outputs=[io.Conditioning.Output(display_name="positive")],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs: Any) -> Any:
+        # The seam is read from disk, so a newly saved seam must invalidate the cache.
+        folder = _seam_dir()
+        if not os.path.isdir(folder):
+            return ""
+        return sorted((name, os.path.getmtime(os.path.join(folder, name))) for name in os.listdir(folder))
+
+    @classmethod
+    def execute(
+        cls,
+        positive: Any,
+        latent: dict[str, Any],
+        vae: Any,
+        plan: dict[str, Any],
+        enabled: bool = True,
+        seam_image: torch.Tensor | None = None,
+    ) -> io.NodeOutput:
+        index = int(plan["chunk_index"])
+        chunk = plan["chunks"][index]
+        if not enabled:
+            return io.NodeOutput(positive)
+        frames = seam_image
+        if frames is None:
+            if not chunk["continues"]:
+                # Chunk 0, or a real cut: the new shot must not start from the old one.
+                return io.NodeOutput(positive)
+            path = _seam_path(plan, index - 1)
+            if not os.path.isfile(path):
+                _LOGGER.info("[CS Seam Guide] no seam saved for chunk %d yet; chunk %d starts unanchored", index - 1, index)
+                return io.NodeOutput(positive)
+            frames = torch.from_numpy(np.load(path)).float() / 255.0
+            _LOGGER.info("[CS Seam Guide] chunk %d starts from %s", index, path)
+        lead = int(chunk["lead"])
+        # The guide takes one frame or a 5, 22, 39... frame clip; its last frame
+        # sits on the last lead frame, which repeats the previous chunk's end.
+        available = min(lead, int(frames.shape[0]))
+        count = 1 if available < 5 else available - (available - 5) % 17
+        return MiniMaxH3AddGuide.execute(
+            positive=positive, latent=latent, frame_idx=max(0, lead - count), vae=vae, image=frames[-count:],
+        )
+
+
 class ShotPlannerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [CSShotPlanner]
+        return [CSShotPlanner, CSSeamSave, CSSeamGuide]
 
 
 async def comfy_entrypoint() -> ShotPlannerExtension:

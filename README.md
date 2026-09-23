@@ -39,6 +39,7 @@ workflow JSON 和示例素材位于插件的 `workflows` 子目录。本文档�
 * 添加 [CS Video Subtitle](#cs-video-subtitle) 节点，将 SRT 字幕渲染到标准 ComfyUI VIDEO，并提供字幕时间线编辑器。
 * 添加 [CS MOSS Audio Transcribe](#cs-moss-audio-transcribe) 节点，将标准 ComfyUI AUDIO 转写为带时间戳的 SRT。
 * 添加 [CS VFX Beauty](#cs-vfx-beauty) 节点，自动估算视频片段肤色并执行皮肤磨皮美化处理。
+* 添加 [CS Seam Save / CS Seam Guide](#cs-seam-save--cs-seam-guide) 节点，分段生成同一镜头时让下一段从上一段结尾接续。
 * 添加 [CS Shot Planner](#cs-shot-planner) 节点，把长视频按镜头切点打包成多个生成片段，逐段排队处理。
 * 添加 [CS Video Segment (SAM3.1)](#cs-video-segment-sam31) 节点，在锚点帧用 Semantic、粗略 Mask、Point 或 BBox 定义对象，并自动传播 mask。
 * 添加 [CS Video Segment (SeC-4B)](#cs-video-segment-sec-4b) 节点，使用 SeC-4B 的概念理解和 LongSAM2.1 记忆传播 mask。
@@ -527,8 +528,9 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - fps：`images` 的帧率。
 - target_seconds / min_seconds / max_seconds：片段的理想、最短、最长时长。
 - frame_step / frame_offset：合法生成长度规则，默认对应 MiniMax 的 `5 + 17k`。
-- shot_cut_frames：可选，手动指定每个新镜头的第一帧。
+- shot_cut_frames：可选，手动指定每个新镜头的第一帧。填 `0` 表示整段是一个镜头（一镜到底），只按 `max_seconds` 平均切段。
 - unload models before chunk：默认开启。每段开始前卸载上一次运行留在显存中的模型，避免显存累积；显存充足时可关闭，沿用已加载的模型以加快推理。开启时节点每次都会重新执行。
+- seam_overlap：默认 `0`。从镜头中间切开的片段，会在开头多生成上一段最后几帧，由 `CS Seam Guide` 锚定，拼接时裁掉。建议 `5`，可同时延续纹理与动作；落在真实切点上的片段不重叠。
 
 #### 输出说明
 
@@ -537,6 +539,14 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - chunk_count：整段视频的片段总数。
 - shot_text：当前片段内的 `[Shot N]` 帧范围（片段内编号）及秒数，可直接拼接进提示词。
 - plan：完整分段计划，包含每段的起止帧、生成帧数、补齐帧数和镜头列表。
+
+### CS Seam Save / CS Seam Guide
+分段生成同一个镜头时，让下一段从上一段的结尾接续，避免接缝处画面跳变。需要本地 MiniMax H3 模型（`Add Guide for MiniMax H3`）。
+
+- `CS Seam Save`：接在第一次采样的 VAE 解码之后（放大之前），`plan` 接 `CS Shot Planner`。保存本段补齐帧之前的最后几帧到 `output/cs_seams/`。
+- `CS Seam Guide`：接在 `MiniMax H3 Reference to Video` 与 guider 之间，`latent` 接 Reference to Video 的 `LATENT`。读取上一段保存的帧，锚定在本段开头。
+- 第 0 段、落在真实切点上的片段、以及上一段尚未保存时直接透传。`enabled` 关闭可停用锚定。
+- `seam_image`：可选，用指定的帧代替自动保存的结果，例如想接续较早某次生成的版本。接上时每一段都会使用它，处理下一段前需断开。
 
 ## Selector 使用说明
 

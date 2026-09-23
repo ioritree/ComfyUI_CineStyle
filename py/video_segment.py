@@ -1895,11 +1895,20 @@ def _planner_chunk_window(prompt: Any, cuts: list[int], frame_count: int) -> tup
         except (TypeError, ValueError):
             return fallback
 
+    # The planner's own cut list wins over this node's, as it does in the planner.
+    own = values.get("shot_cut_frames")
+    if isinstance(own, (list, tuple)):
+        raise ValueError(
+            "CS Shot Planner's shot_cut_frames is connected to another node, so this node cannot follow it. "
+            "Set it as a widget value or use work_frame instead."
+        )
+    own_cuts = _parse_cut_frames(own, frame_count)
     plan = planner(
-        frame_count, cuts, number("fps", 24.0), number("target_seconds", 8.0),
+        frame_count, own_cuts if own_cuts is not None else cuts, number("fps", 24.0), number("target_seconds", 8.0),
         number("min_seconds", 4.0), number("max_seconds", 10.0),
         int(number("frame_step", 17)), int(number("frame_offset", 5)),
         int(number("max_shots_per_chunk", 0)),
+        overlap=int(number("seam_overlap", 0)),
     )
     chunks = plan["chunks"]
     if not chunks:
@@ -1912,7 +1921,7 @@ def _planner_chunk_window(prompt: Any, cuts: list[int], frame_count: int) -> tup
         chunk = chunks[index] if 0 <= index < len(chunks) else None
     if chunk is None:
         raise ValueError(f"CS Shot Planner has {len(chunks)} chunks; its current selection is out of range.")
-    return (chunk["start"], chunk["end"]), f"chunk #{chunk['index']}"
+    return (chunk["start"] - chunk["lead"], chunk["end"]), f"chunk #{chunk['index']}"
 
 
 def _parse_frame_range(value: str | None, frame_count: int) -> tuple[int, int] | None:
@@ -2324,10 +2333,12 @@ class CSVideoSegmentSAM3(io.ComfyNode):
             _segment_info(node_name, f"work_frame {target} selects shot {window[0]}-{window[1] - 1}")
         if window is not None:
             low, high = window
+            # A track reaching into the window still has to run from its anchor,
+            # which may sit before or after the window.
             segments = [
-                (anchor, max(start, low), min(end, high))
+                (anchor, max(start, min(low, anchor)), min(end, max(high, anchor + 1)))
                 for anchor, start, end in segments
-                if low <= anchor < high
+                if start < high and end > low
             ]
             segments = [item for item in segments if item[2] > item[1]]
             _segment_info(
