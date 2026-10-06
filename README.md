@@ -519,7 +519,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 
 - 片段边界只落在镜头切点上，不会从镜头中间切开；相邻镜头会被合并，使每段尽量接近 `target_seconds`，不超过 `max_seconds`，并尽量不短于 `min_seconds`。
 - 单个镜头长于 `max_seconds` 时，会在镜头内部平均切开，日志会给出警告。
-- 生成长度会向上取整为 `frame_offset + k × frame_step`（MiniMax 为 `5 + 17k`）。多出的帧取自下一个镜头的开头，最后一段则重复最后一帧补齐；`shot_text` 会标明这些补齐帧，拼接成片时需要裁掉。
+- 生成长度会向上取整为 `frame_offset + k × frame_step`（MiniMax 为 `5 + 17k`），且不少于 124 帧（MiniMax H3 的训练下限，过短会让伪彩遮罩原样穿透）。多出的帧取自下一个镜头的开头，最后一段则重复最后一帧补齐；`shot_text` 会标明这些补齐帧，拼接成片时需要裁掉。
 - 切点来源优先级：`shot_cut_frames` → `video_info.shot_cuts` → 自动检测（与 SAM3.1 节点使用同一检测器）。
 
 #### 节点选项说明
@@ -531,6 +531,19 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - shot_cut_frames：可选，手动指定每个新镜头的第一帧。填 `0` 表示整段是一个镜头（一镜到底），只按 `max_seconds` 平均切段。
 - unload models before chunk：默认开启。每段开始前卸载上一次运行留在显存中的模型，避免显存累积；显存充足时可关闭，沿用已加载的模型以加快推理。开启时节点每次都会重新执行。
 - seam_overlap：默认 `0`。从镜头中间切开的片段，会在开头多生成上一段最后几帧，由 `CS Seam Guide` 锚定，拼接时裁掉。建议 `5`，可同时延续纹理与动作；落在真实切点上的片段不重叠。
+- chunk_notes：可选，按片段附加到 `shot_text` 之后的说明（例如动作时间轴）。每段以 `▼ chunk 1` 这样的一行开头，第一个标题之前的文字每段都会附加。提示词模型拿不到 `chunk_index`，把所有片段的时间轴一起给它会被混用。
+- chunk_breaks：可选，强制从这些切点开始新片段，通常由 Edit Chunks 填写。不在切点上的帧会被忽略。片段编号会随之改变，需同步修改 `chunk_notes`。
+- blend：默认 `0.3`。`blend_mask` 中伪彩的不透明度，等同 ImageBlend 的 `blend_factor`。
+- solid_shots：可选，填镜头内任一原片帧号（例如镜头第一帧），这些镜头的 `blend_mask` 使用 `1.0`。适合整个画面被遮罩填满的局部特写（嘴唇、眼睛）：低 blend 会透出原片的痣和胡子，而全身镜头用 `1.0` 会被剪影轮廓锁住发型。
+
+#### Edit Chunks
+
+运行一次后点击节点上的 Edit Chunks，按镜头列出缩略图、所属片段、片段内的 `[Shot N]` 与秒数（与 `shot_text` 一致）以及原片帧范围。
+
+- 点击两个镜头之间的 ✂，强制从该切点开始新片段；再点一次取消。适合构图相似的相邻镜头被模型当成同一镜头、身份互相串用的情况。
+- Isolate 让单个镜头独立成段。很短的镜头会补到 124 帧，补齐比例在下方片段列表中标示；`padding` 为 `next shot frames` 时补齐帧会借用下一个镜头。
+- Solid 把该镜头加入 `solid_shots`，`blend_mask` 在这个镜头使用 `1.0`；再点一次取消。
+- 片段列表标出编号改变的片段（was chunk N），Set chunk_index 可直接切换要输出的片段。Apply 写入 `chunk_breaks` 与 `solid_shots`。
 
 #### 输出说明
 
@@ -539,12 +552,14 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - chunk_count：整段视频的片段总数。
 - shot_text：当前片段内的 `[Shot N]` 帧范围（片段内编号）及秒数，可直接拼接进提示词。
 - plan：完整分段计划，包含每段的起止帧、生成帧数、补齐帧数和镜头列表。
+- blend_mask：`MASK` 逐帧乘上 `blend`（`solid_shots` 中的镜头为 `1.0`）。代替 ImageBlend：`ImageCompositeMasked` 的 `destination` 接 `IMAGE`、`source` 直接接 `color_mask`、`mask` 接 `blend_mask`。
+- shot_prompt：不经提示词模型、直接手写视频提示词时使用的英文逐镜头行，例如 `[Shot 2] 3.17s: <Subject 2> on the left, <Subject 1> on the right.`。遮罩第 N 个颜色对应 `<Subject N>`，时间、左右和缺席的人物由遮罩算出；`chunk_notes` 中本段以 `[Shot N]` 开头的行接在对应镜头后面（可写 `[Shot 4][Shot 7]` 同时指定多个），其余行附在最后。角色外观与替换指令请另外写在文字节点，再与 `shot_prompt` 拼接。
 
 ### CS Seam Save / CS Seam Guide
 分段生成同一个镜头时，让下一段从上一段的结尾接续，避免接缝处画面跳变。需要本地 MiniMax H3 模型（`Add Guide for MiniMax H3`）。
 
 - `CS Seam Save`：接在第一次采样的 VAE 解码之后（放大之前），`plan` 接 `CS Shot Planner`。保存本段补齐帧之前的最后几帧到 `output/cs_seams/`。
-- `CS Seam Guide`：接在 `MiniMax H3 Reference to Video` 与 guider 之间，`latent` 接 Reference to Video 的 `LATENT`。读取上一段保存的帧，锚定在本段开头。
+- `CS Seam Guide`：接在 `MiniMax H3 Reference to Video` 与 guider 之间，`latent` 接采样器实际使用的 latent（与采样器 `latent_image` 同一来源）；尺寸不一致时采样会报 shape mismatch。读取上一段保存的帧，锚定在本段开头。
 - 第 0 段、落在真实切点上的片段、以及上一段尚未保存时直接透传。`enabled` 关闭可停用锚定。
 - `seam_image`：可选，用指定的帧代替自动保存的结果，例如想接续较早某次生成的版本。接上时每一段都会使用它，处理下一段前需断开。
 

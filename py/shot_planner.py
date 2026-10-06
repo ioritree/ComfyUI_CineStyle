@@ -8,6 +8,9 @@ an incrementing ``chunk_index`` processes the whole video in one click.
 
 from __future__ import annotations
 
+import base64
+import bisect
+import io as py_io
 import logging
 import math
 import os
@@ -18,8 +21,10 @@ from typing import Any
 
 import numpy as np
 import torch
+from aiohttp import web
 from comfy_api.latest import ComfyExtension, io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3AddGuide
+from PIL import Image
 from typing_extensions import override
 
 import comfy.model_management
@@ -31,6 +36,9 @@ _LOGGER = logging.getLogger("CineStyleShotPlanner")
 # Chunks shorter than min_seconds are allowed only when the shots around them
 # leave no better packing; this penalty keeps them rare.
 _SHORT_CHUNK_PENALTY = 50.0
+# MiniMax H3 is trained on ~124-362 frames; shorter generations let the pseudo
+# colour masks pass through unchanged, so short chunks are padded up to this.
+_MIN_GENERATION_FRAMES = 124
 
 
 def _parse_cut_list(value: Any, frame_count: int) -> list[int] | None:
@@ -47,7 +55,7 @@ def _parse_cut_list(value: Any, frame_count: int) -> list[int] | None:
     try:
         frames = [int(float(part)) for part in parts]
     except (TypeError, ValueError) as exc:
-        raise ValueError("shot_cut_frames must be a comma-separated list of frame numbers.") from exc
+        raise ValueError("shot_cut_frames, chunk_breaks and solid_shots must be comma-separated lists of frame numbers.") from exc
     return sorted({frame for frame in frames if 0 < frame < frame_count})
 
 
@@ -94,16 +102,19 @@ def plan_chunks(
     frame_offset: int,
     max_shots: int = 0,
     overlap: int = 0,
+    breaks: list[int] | None = None,
 ) -> dict[str, Any]:
     """Pack shots into chunks close to ``target_seconds`` with dynamic programming.
 
     A chunk that starts inside a shot re-generates ``overlap`` frames of the
     previous chunk as its ``lead``, so the seam can be anchored on them.
+    ``breaks`` are cuts where a chunk must start; other frames are ignored.
     """
     max_frames = max(1, int(math.floor(max_seconds * fps)))
     shot_bounds = [0, *[cut for cut in cuts if 0 < cut < frame_count], frame_count]
     bounds = _split_long_shots(shot_bounds, max(1, max_frames - overlap))
     split_inside_shots = len(bounds) != len(shot_bounds)
+    forced = sorted(set(breaks or []) & set(shot_bounds[1:-1]))
 
     shot_edges = set(shot_bounds)
     best: dict[int, tuple[float, list[tuple[int, int]]]] = {0: (0.0, [])}
@@ -111,6 +122,8 @@ def plan_chunks(
         for start_index in range(end_index - 1, -1, -1):
             length = bounds[end_index] - bounds[start_index]
             if length > max_frames:
+                break
+            if any(bounds[start_index] < edge < bounds[end_index] for edge in forced):
                 break
             if bounds[start_index] not in shot_edges:
                 length += overlap
@@ -141,7 +154,7 @@ def plan_chunks(
         length = end - start
         continues = start not in shot_edges
         lead = overlap if continues else 0
-        generation = _generation_length(length + lead, frame_step, frame_offset)
+        generation = _generation_length(max(length + lead, _MIN_GENERATION_FRAMES), frame_step, frame_offset)
         shots = [
             [max(start - lead, shot_start), min(end, shot_end)]
             for shot_start, shot_end in zip(shot_bounds[:-1], shot_bounds[1:])
@@ -164,6 +177,7 @@ def plan_chunks(
         "max_shots": max_shots,
         "overlap": overlap,
         "cuts": [cut for cut in cuts if 0 < cut < frame_count],
+        "breaks": forced,
         "split_inside_shots": split_inside_shots,
         "target_seconds": target_seconds,
         "min_seconds": min_seconds,
@@ -352,6 +366,100 @@ def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bo
     return line
 
 
+def _split_notes(notes: str | None) -> tuple[list[str], dict[int, list[str]]]:
+    """Lines before the first ``▼ chunk N`` marker, and each chunk's lines including its marker."""
+    shared: list[str] = []
+    parts: dict[int, list[str]] = {}
+    current = shared
+    for line in str(notes or "").splitlines():
+        marker = re.match(r"\s*▼?\s*chunk\s*(\d+)", line, re.IGNORECASE)
+        if marker:
+            current = parts.setdefault(int(marker.group(1)), [])
+        current.append(line)
+    return shared, parts
+
+
+def _chunk_note(notes: str | None, index: int) -> str:
+    """The part of ``notes`` for this chunk, plus the shared lines before the first marker.
+
+    The prompt model never sees chunk_index, so given every chunk's timeline it
+    blends them; only the matching part may reach it.
+    """
+    shared, parts = _split_notes(notes)
+    if parts and index not in parts:
+        _LOGGER.warning("[CS Shot Planner] chunk_notes has no part for chunk %d", index)
+    text = "\n".join([*shared, *parts.get(index, [])]).strip()
+    return "\n\n" + text if text else ""
+
+
+def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool,
+                 present: list[dict[str, Any]], colors: list[str], notes: str | None, index: int) -> str:
+    """Per-shot lines for a hand-written video prompt, without a prompt model in between.
+
+    Mask colour N is ``<Subject N>``.  Times, sides and absences come from the
+    masks; ``[Shot N]`` lines in this chunk's part of ``notes`` are appended to
+    their shot, and its other lines follow the shots.
+    """
+    tagged: dict[int, list[str]] = {}
+    others: list[str] = []
+    for line in _split_notes(notes)[1].get(index, [])[1:]:
+        match = re.match(r"\s*((?:\[Shot\s*\d+\]\s*)+)(.*)", line)
+        if match:
+            for number in re.findall(r"\d+", match.group(1)):
+                tagged.setdefault(int(number), []).append(match.group(2).strip())
+        elif line.strip():
+            others.append(line.strip())
+
+    start = chunk["start"] - chunk["lead"]
+    sides_en = {"畫面左側": "left", "畫面右側": "right"}
+    lines = []
+    for number, (shot_start, shot_end) in enumerate(chunk["shots"], start=1):
+        local_start, local_end = shot_start - start, shot_end - start
+        seen = [
+            item for item in present
+            if any(flag and local_start <= position * int(item["step"]) < local_end for position, flag in enumerate(item["seen"]))
+        ]
+        placed = sorted(zip(seen, _sides(seen, local_start, local_end)), key=lambda pair: pair[1] != "畫面左側")
+        shown = ", ".join(
+            f"<Subject {item['index']}>" + (f" on the {sides_en[side]}" if side else "")
+            for item, side in placed
+        )
+        absent = ", ".join(f"<Subject {item['index']}>" for item in present if item not in seen)
+        if absent:
+            verb = "is" if "," not in absent else "are"
+            shown = f"Only {shown}; {absent} {verb} not in this shot" if shown else f"{absent} {verb} not in this shot"
+        line = f"[Shot {number}] {local_start / fps:.2f}s:"
+        if shown:
+            line += f" {shown}."
+        if tagged.get(number):
+            line += " " + " ".join(tagged[number])
+        lines.append(line)
+    if chunk["extra_frames"] > 0:
+        held = chunk["lead"] + chunk["frames"]
+        if not freeze and chunk["end"] < frame_count:
+            lines.append(f"[Shot {len(chunk['shots']) + 1}] {held / fps:.2f}s: the start of the next shot.")
+        else:
+            lines.append(f"From {held / fps:.2f}s the last frame holds still; there is no new shot.")
+    return "\n".join([*lines, *others])
+
+
+def _blend_weights(plan: dict[str, Any], chunk: dict[str, Any], length: int, freeze: bool,
+                   blend: float, solid_frames: list[int]) -> list[float]:
+    """Pseudo-colour opacity of each chunk frame: 1.0 in shots containing ``solid_frames``, else ``blend``.
+
+    A frame-filling close-up keeps the source's moles and stubble at a low blend,
+    while a solid silhouette elsewhere locks the source's hair outline.
+    """
+    bounds = [0, *plan["cuts"], plan["frame_count"]]
+    solid = {bisect.bisect_right(bounds, frame) - 1 for frame in solid_frames}
+    start = chunk["start"] - chunk["lead"]
+    last = chunk["end"] - 1 if freeze else plan["frame_count"] - 1
+    return [
+        1.0 if bisect.bisect_right(bounds, min(start + offset, last)) - 1 in solid else blend
+        for offset in range(length)
+    ]
+
+
 def _format_seconds(frames: int, fps: float) -> str:
     return f"{frames / fps:.2f}s"
 
@@ -407,6 +515,60 @@ def _shot_text(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool
     if presence:
         text += "\n" + presence
     return text
+
+
+# Edit Chunks reads the last run's cuts and one thumbnail per shot from here.
+_SHOT_CACHE: dict[str, dict[str, Any]] = {}
+_SHOT_CACHE_LIMIT = 8
+_ROUTES_REGISTERED = False
+
+
+def _remember_shots(node_id: Any, images: torch.Tensor, cuts: list[int]) -> None:
+    key = str(node_id or "")
+    if not key:
+        return
+    frame_count = int(images.shape[0])
+    cached = _SHOT_CACHE.get(key)
+    if cached and cached["frame_count"] == frame_count and cached["cuts"] == cuts:
+        return
+    bounds = [0, *cuts, frame_count]
+    thumbs = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        frame = (images[(start + end) // 2, ..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
+        picture = Image.fromarray(frame)
+        picture.thumbnail((240, 240))
+        buffer = py_io.BytesIO()
+        picture.save(buffer, format="JPEG", quality=80)
+        thumbs.append("data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"))
+    _SHOT_CACHE.pop(key, None)
+    _SHOT_CACHE[key] = {"frame_count": frame_count, "cuts": list(cuts), "thumbs": thumbs}
+    while len(_SHOT_CACHE) > _SHOT_CACHE_LIMIT:
+        _SHOT_CACHE.pop(next(iter(_SHOT_CACHE)))
+
+
+async def _shot_cache_route(request: web.Request) -> web.Response:
+    entry = _SHOT_CACHE.get(str(request.query.get("node_id", "")))
+    if entry is None:
+        return web.json_response({"error": "Run the workflow once so CS Shot Planner knows the shots."}, status=404)
+    return web.json_response(entry)
+
+
+async def _shot_plan_route(request: web.Request) -> web.Response:
+    payload = await request.json()
+    entry = _SHOT_CACHE.get(str(payload.get("node_id", "")))
+    if entry is None:
+        return web.json_response({"error": "Run the workflow once so CS Shot Planner knows the shots."}, status=404)
+    try:
+        plan = plan_chunks(
+            entry["frame_count"], entry["cuts"], float(payload["fps"]), float(payload["target_seconds"]),
+            float(payload["min_seconds"]), float(payload["max_seconds"]), int(payload["frame_step"]),
+            int(payload["frame_offset"]), max(0, int(payload["max_shots_per_chunk"])),
+            overlap=max(0, int(payload["seam_overlap"])),
+            breaks=[int(frame) for frame in payload.get("breaks") or []],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    return web.json_response(plan)
 
 
 class CSShotPlanner(io.ComfyNode):
@@ -499,7 +661,44 @@ class CSShotPlanner(io.ComfyNode):
                         "motion across the seam; 0 anchors a single frame. Chunks that start on a cut get none."
                     ),
                 ),
+                io.String.Input(
+                    "chunk_notes",
+                    default="",
+                    multiline=True,
+                    optional=True,
+                    tooltip=(
+                        "Per-chunk notes appended to shot_text, e.g. an action timeline. Start each chunk's part "
+                        "with a line like '▼ chunk 1'; text before the first such line is added to every chunk."
+                    ),
+                ),
+                io.String.Input(
+                    "chunk_breaks",
+                    default="",
+                    optional=True,
+                    tooltip=(
+                        "Cut frames where a new chunk must start, set with Edit Chunks. Frames that are not "
+                        "cuts are ignored. Chunks are renumbered, so check chunk_notes after changing this."
+                    ),
+                ),
+                io.Float.Input(
+                    "blend",
+                    default=0.3,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Pseudo-colour opacity in blend_mask, like ImageBlend's blend_factor.",
+                ),
+                io.String.Input(
+                    "solid_shots",
+                    default="",
+                    optional=True,
+                    tooltip=(
+                        "A frame inside each shot whose blend_mask uses 1.0, e.g. a close-up that fills the frame. "
+                        "Source frame numbers, so they stay valid when chunks are renumbered."
+                    ),
+                ),
             ],
+            hidden=[io.Hidden.unique_id],
             outputs=[
                 io.Image.Output("images", display_name="IMAGE"),
                 io.Image.Output("color_mask", display_name="color_mask"),
@@ -509,6 +708,22 @@ class CSShotPlanner(io.ComfyNode):
                 io.Int.Output("chunk_count", display_name="chunk_count"),
                 io.String.Output("shot_text", display_name="shot_text"),
                 io.Dict.Output("plan", display_name="plan"),
+                io.String.Output(
+                    "shot_prompt",
+                    display_name="shot_prompt",
+                    tooltip=(
+                        "English per-shot lines for a hand-written video prompt: chunk-local times, sides and "
+                        "absences as <Subject N> for mask colour N, plus this chunk's [Shot N] lines from chunk_notes."
+                    ),
+                ),
+                io.Mask.Output(
+                    "blend_mask",
+                    display_name="blend_mask",
+                    tooltip=(
+                        "MASK scaled per frame by blend, or 1.0 in solid_shots. Use as the mask of "
+                        "ImageCompositeMasked with color_mask as source, instead of ImageBlend."
+                    ),
+                ),
             ],
         )
 
@@ -531,6 +746,10 @@ class CSShotPlanner(io.ComfyNode):
         locate_frame: int = -1,
         max_shots_per_chunk: int = 0,
         seam_overlap: int = 0,
+        chunk_notes: str = "",
+        chunk_breaks: str = "",
+        blend: float = 0.3,
+        solid_shots: str = "",
         padding: str = "freeze last frame",
         shot_cut_frames: str = "",
         video_info: dict[str, Any] | None = None,
@@ -564,7 +783,9 @@ class CSShotPlanner(io.ComfyNode):
             frame_count, cuts, float(fps), float(target_seconds), float(min_seconds), float(max_seconds),
             int(frame_step), int(frame_offset), max(0, int(max_shots_per_chunk)),
             overlap=max(0, int(seam_overlap)),
+            breaks=_parse_cut_list(chunk_breaks, frame_count),
         )
+        _remember_shots(cls.hidden.unique_id, images, plan["cuts"])
         plan["cut_source"] = cut_source
         plan["padding"] = str(padding)
         chunk_count = len(plan["chunks"])
@@ -597,7 +818,7 @@ class CSShotPlanner(io.ComfyNode):
             f"#{item['index']} {item['start']}-{item['end'] - 1} ({item['frames'] / fps:.2f}s→{item['generation_frames']}f)"
             for item in plan["chunks"]
         )
-        _LOGGER.info("[CS Shot Planner] %s cuts=%s; chunks: %s", cut_source, plan["cuts"], summary)
+        _LOGGER.info("[CS Shot Planner] %s cuts=%s breaks=%s; chunks: %s", cut_source, plan["cuts"], plan["breaks"], summary)
         if plan["split_inside_shots"]:
             _LOGGER.warning("[CS Shot Planner] a shot is longer than max_seconds and was split inside the shot.")
 
@@ -613,6 +834,9 @@ class CSShotPlanner(io.ComfyNode):
             chunk_mask = _slice_frames(mask, start, end, length, freeze)
         else:
             chunk_mask = torch.zeros(length, chunk_images.shape[1], chunk_images.shape[2], dtype=torch.float32)
+        weights = _blend_weights(plan, chunk, length, freeze, float(blend), _parse_cut_list(solid_shots, frame_count) or [])
+        _LOGGER.info("[CS Shot Planner] chunk %d blend_mask: blend %g, %d of %d frames at 1.0", index, float(blend), weights.count(1.0), length)
+        blend_mask = chunk_mask * torch.tensor(weights, dtype=chunk_mask.dtype, device=chunk_mask.device).view(-1, 1, 1)
         seconds = length / float(fps)
         if isinstance(audio, Mapping) and "waveform" in audio:
             # Audio follows the same window as the frames.
@@ -648,8 +872,10 @@ class CSShotPlanner(io.ComfyNode):
             chunk_audio,
             length,
             chunk_count,
-            _shot_text(chunk, float(fps), frame_count, freeze, present, colors),
+            _shot_text(chunk, float(fps), frame_count, freeze, present, colors) + _chunk_note(chunk_notes, index),
             plan,
+            _shot_prompt(chunk, float(fps), frame_count, freeze, present, colors, chunk_notes, index),
+            blend_mask,
         )
 
 
@@ -713,7 +939,7 @@ class CSSeamGuide(io.ComfyNode):
             ),
             inputs=[
                 io.Conditioning.Input("positive"),
-                io.Latent.Input("latent", tooltip="LATENT from MiniMax H3 Reference to Video."),
+                io.Latent.Input("latent", tooltip="The latent the sampler denoises. The anchor frames are sized to it, so a different latent fails with a shape mismatch."),
                 io.Vae.Input("vae", tooltip="MiniMax H3 video VAE."),
                 io.Dict.Input("plan", tooltip="plan from CS Shot Planner."),
                 io.Boolean.Input("enabled", default=True),
@@ -773,6 +999,19 @@ class CSSeamGuide(io.ComfyNode):
 
 
 class ShotPlannerExtension(ComfyExtension):
+    @override
+    async def on_load(self) -> None:
+        global _ROUTES_REGISTERED
+        if _ROUTES_REGISTERED:
+            return
+        from server import PromptServer
+
+        instance = getattr(PromptServer, "instance", None)
+        if instance is not None:
+            instance.routes.get("/cinestyle/shot-planner-cache")(_shot_cache_route)
+            instance.routes.post("/cinestyle/shot-planner-plan")(_shot_plan_route)
+            _ROUTES_REGISTERED = True
+
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [CSShotPlanner, CSSeamSave, CSSeamGuide]

@@ -1903,12 +1903,19 @@ def _planner_chunk_window(prompt: Any, cuts: list[int], frame_count: int) -> tup
             "Set it as a widget value or use work_frame instead."
         )
     own_cuts = _parse_cut_frames(own, frame_count)
+    breaks = values.get("chunk_breaks")
+    if isinstance(breaks, (list, tuple)):
+        raise ValueError(
+            "CS Shot Planner's chunk_breaks is connected to another node, so this node cannot follow it. "
+            "Set it as a widget value or use work_frame instead."
+        )
     plan = planner(
         frame_count, own_cuts if own_cuts is not None else cuts, number("fps", 24.0), number("target_seconds", 8.0),
         number("min_seconds", 4.0), number("max_seconds", 10.0),
         int(number("frame_step", 17)), int(number("frame_offset", 5)),
         int(number("max_shots_per_chunk", 0)),
         overlap=int(number("seam_overlap", 0)),
+        breaks=_parse_cut_frames(breaks, frame_count),
     )
     chunks = plan["chunks"]
     if not chunks:
@@ -1949,7 +1956,7 @@ def _parse_cut_frames(value: str | None, frame_count: int) -> list[int] | None:
     try:
         frames = [int(float(part)) for part in re.split(r"[\s,;\[\]]+", text) if part]
     except ValueError as exc:
-        raise ValueError("shot_cut_frames must be a comma-separated list of frame numbers.") from exc
+        raise ValueError("shot_cut_frames and chunk_breaks must be comma-separated lists of frame numbers.") from exc
     return sorted({frame for frame in frames if 0 < frame < frame_count})
 
 
