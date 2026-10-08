@@ -535,6 +535,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - chunk_breaks：可选，强制从这些切点开始新片段，通常由 Edit Chunks 填写。不在切点上的帧会被忽略。片段编号会随之改变，需同步修改 `chunk_notes`。
 - blend：默认 `0.3`。`blend_mask` 中伪彩的不透明度，等同 ImageBlend 的 `blend_factor`。
 - solid_shots：可选，填镜头内任一原片帧号（例如镜头第一帧），这些镜头的 `blend_mask` 使用 `1.0`。适合整个画面被遮罩填满的局部特写（嘴唇、眼睛）：低 blend 会透出原片的痣和胡子，而全身镜头用 `1.0` 会被剪影轮廓锁住发型。
+- subjects：可选，每行一个 `<Subject N> 外观`，N 对应遮罩第 N 个颜色。填写后 `shot_prompt` 只定义、替换本段出现的人物，并在每个镜头重抄其外观；不在本段的人物不会出现在提示词里，避免模型把他画到别人身上。仅局部入镜的人物只标注可见部分。
 
 #### Edit Chunks
 
@@ -553,7 +554,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - shot_text：当前片段内的 `[Shot N]` 帧范围（片段内编号）及秒数，可直接拼接进提示词。
 - plan：完整分段计划，包含每段的起止帧、生成帧数、补齐帧数和镜头列表。
 - blend_mask：`MASK` 逐帧乘上 `blend`（`solid_shots` 中的镜头为 `1.0`）。代替 ImageBlend：`ImageCompositeMasked` 的 `destination` 接 `IMAGE`、`source` 直接接 `color_mask`、`mask` 接 `blend_mask`。
-- shot_prompt：不经提示词模型、直接手写视频提示词时使用的英文逐镜头行，例如 `[Shot 2] 3.17s: <Subject 2> on the left, <Subject 1> on the right.`。遮罩第 N 个颜色对应 `<Subject N>`，时间、左右和缺席的人物由遮罩算出；`chunk_notes` 中本段以 `[Shot N]` 开头的行接在对应镜头后面（可写 `[Shot 4][Shot 7]` 同时指定多个），其余行附在最后。角色外观与替换指令请另外写在文字节点，再与 `shot_prompt` 拼接。
+- shot_prompt：不经提示词模型、直接手写视频提示词时使用的英文逐镜头行，例如 `[Shot 2] 3.17s: <Subject 2> on the left, <Subject 1> on the right.`。遮罩第 N 个颜色对应 `<Subject N>`，时间、左右和缺席的人物由遮罩算出；`chunk_notes` 中本段以 `[Shot N]` 开头的行接在对应镜头后面（可写 `[Shot 4][Shot 7]` 同时指定多个），其余行附在最后。角色外观与替换指令请另外写在文字节点，再与 `shot_prompt` 拼接；填写 `subjects` 时，`shot_prompt` 已包含 `subject_definitions`、替换指令与去除遮罩颜色的要求，文字节点只需写与人物无关的通用要求，并接在 `shot_prompt` 之后。
 
 ### CS Seam Save / CS Seam Guide
 分段生成同一个镜头时，让下一段从上一段的结尾接续，避免接缝处画面跳变。需要本地 MiniMax H3 模型（`Add Guide for MiniMax H3`）。

@@ -224,6 +224,10 @@ _COLOR_NAMES = {
     "#FF0000": "紅色", "#00FF00": "綠色", "#0000FF": "藍色", "#FFFF00": "黃色",
     "#FF00FF": "洋紅", "#00FFFF": "青色", "#FF8000": "橙色", "#8000FF": "紫色",
 }
+_COLOR_NAMES_EN = {
+    "#FF0000": "red", "#00FF00": "green", "#0000FF": "blue", "#FFFF00": "yellow",
+    "#FF00FF": "magenta", "#00FFFF": "cyan", "#FF8000": "orange", "#8000FF": "purple",
+}
 
 
 def _present_objects(color_chunk: torch.Tensor, colors: list[str]) -> list[dict[str, Any]]:
@@ -320,6 +324,11 @@ def _sides(present: list[dict[str, Any]], start: int = 0, end: int = 1 << 30) ->
     return blank
 
 
+def _fragment(item: dict[str, Any]) -> bool:
+    """A limb or edge of someone outside the frame, not a person to render whole."""
+    return item["active"] < 8.0 and item["cut_off"] >= 0.5
+
+
 def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bool = False) -> str:
     def describe(item: dict[str, Any]) -> str:
         index = int(item["index"])
@@ -327,7 +336,7 @@ def _presence_text(present: list[dict[str, Any]], colors: list[str], located: bo
         ratio = item["frames_seen"] / max(1, item["frames"])
         # Size and duration are separate: a figure that fills a fifth of the
         # frame and then walks out is a real character, not a fragment.
-        if item["active"] < 8.0 and item["cut_off"] >= 0.5:
+        if _fragment(item):
             role = (
                 f"僅局部入鏡（出現時平均佔畫面 {item['active']}%，出現於 {item['frames_seen']}/{item['frames']} 取樣幀）"
                 "，只描述可見部位，不要描述看不到的臉、髮型或服裝整體，也不要生成完整人物"
@@ -392,14 +401,31 @@ def _chunk_note(notes: str | None, index: int) -> str:
     return "\n\n" + text if text else ""
 
 
+def _parse_subjects(value: str | None) -> dict[int, str]:
+    """``<Subject N> appearance`` lines, keyed by N."""
+    subjects = {}
+    for line in str(value or "").splitlines():
+        match = re.match(r"\s*<Subject\s*(\d+)>\s*(.+)", line)
+        if match:
+            subjects[int(match.group(1))] = match.group(2).strip().rstrip(".")
+    return subjects
+
+
 def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bool,
-                 present: list[dict[str, Any]], colors: list[str], notes: str | None, index: int) -> str:
+                 present: list[dict[str, Any]], colors: list[str], notes: str | None, index: int,
+                 subjects: dict[int, str] | None = None) -> str:
     """Per-shot lines for a hand-written video prompt, without a prompt model in between.
 
     Mask colour N is ``<Subject N>``.  Times, sides and absences come from the
     masks; ``[Shot N]`` lines in this chunk's part of ``notes`` are appended to
     their shot, and its other lines follow the shots.
+
+    With ``subjects`` the prompt defines and replaces only the people whose
+    mask is in this chunk, and restates their appearance in every shot they are
+    in: defining someone who is not on screen makes the video model paint him
+    onto the person who is.
     """
+    subjects = subjects or {}
     tagged: dict[int, list[str]] = {}
     others: list[str] = []
     for line in _split_notes(notes)[1].get(index, [])[1:]:
@@ -420,8 +446,14 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
             if any(flag and local_start <= position * int(item["step"]) < local_end for position, flag in enumerate(item["seen"]))
         ]
         placed = sorted(zip(seen, _sides(seen, local_start, local_end)), key=lambda pair: pair[1] != "畫面左側")
+        def looks(item: dict[str, Any]) -> str:
+            subject = int(item["index"])
+            if subject not in subjects:
+                return ""
+            return " (only partly visible)" if _fragment(item) else f" ({subjects[subject]})"
+
         shown = ", ".join(
-            f"<Subject {item['index']}>" + (f" on the {sides_en[side]}" if side else "")
+            f"<Subject {item['index']}>" + (f" on the {sides_en[side]}" if side else "") + looks(item)
             for item, side in placed
         )
         absent = ", ".join(f"<Subject {item['index']}>" for item in present if item not in seen)
@@ -440,7 +472,23 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
             lines.append(f"[Shot {len(chunk['shots']) + 1}] {held / fps:.2f}s: the start of the next shot.")
         else:
             lines.append(f"From {held / fps:.2f}s the last frame holds still; there is no new shot.")
-    return "\n".join([*lines, *others])
+    defined = [item for item in present if int(item["index"]) in subjects]
+    if not defined:
+        return "\n".join([*lines, *others])
+
+    def colour(item: dict[str, Any]) -> str:
+        code = str(colors[int(item["index"]) - 1]).upper() if int(item["index"]) - 1 < len(colors) else ""
+        return _COLOR_NAMES_EN.get(code, code)
+
+    header = [
+        "subject_definitions:",
+        *(f"<Subject {item['index']}> {subjects[int(item['index'])]}." for item in defined),
+        "",
+        "integrated_multimodal_description:",
+        *(f"Replace the person under the {colour(item)} mask in <Video 1> with <Subject {item['index']}>." for item in defined),
+    ]
+    footer = f"Do not keep any {' or '.join(colour(item) for item in defined)} mask color in the result."
+    return "\n".join([*header, *lines, *others, footer])
 
 
 def _blend_weights(plan: dict[str, Any], chunk: dict[str, Any], length: int, freeze: bool,
@@ -697,6 +745,16 @@ class CSShotPlanner(io.ComfyNode):
                         "Source frame numbers, so they stay valid when chunks are renumbered."
                     ),
                 ),
+                io.String.Input(
+                    "subjects",
+                    default="",
+                    multiline=True,
+                    optional=True,
+                    tooltip=(
+                        "One '<Subject N> appearance' line per mask colour N. shot_prompt then defines and replaces "
+                        "only the subjects whose mask is in this chunk, and repeats their appearance in each of their shots."
+                    ),
+                ),
             ],
             hidden=[io.Hidden.unique_id],
             outputs=[
@@ -750,6 +808,7 @@ class CSShotPlanner(io.ComfyNode):
         chunk_breaks: str = "",
         blend: float = 0.3,
         solid_shots: str = "",
+        subjects: str = "",
         padding: str = "freeze last frame",
         shot_cut_frames: str = "",
         video_info: dict[str, Any] | None = None,
@@ -874,7 +933,7 @@ class CSShotPlanner(io.ComfyNode):
             chunk_count,
             _shot_text(chunk, float(fps), frame_count, freeze, present, colors) + _chunk_note(chunk_notes, index),
             plan,
-            _shot_prompt(chunk, float(fps), frame_count, freeze, present, colors, chunk_notes, index),
+            _shot_prompt(chunk, float(fps), frame_count, freeze, present, colors, chunk_notes, index, _parse_subjects(subjects)),
             blend_mask,
         )
 
