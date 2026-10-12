@@ -554,7 +554,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - shot_text：当前片段内的 `[Shot N]` 帧范围（片段内编号）及秒数，可直接拼接进提示词。
 - plan：完整分段计划，包含每段的起止帧、生成帧数、补齐帧数和镜头列表。
 - blend_mask：`MASK` 逐帧乘上 `blend`（`solid_shots` 中的镜头为 `1.0`）。代替 ImageBlend：`ImageCompositeMasked` 的 `destination` 接 `IMAGE`、`source` 直接接 `color_mask`、`mask` 接 `blend_mask`。
-- shot_prompt：不经提示词模型、直接手写视频提示词时使用的英文逐镜头行，例如 `[Shot 2] 3.17s: <Subject 2> on the left, <Subject 1> on the right.`。遮罩第 N 个颜色对应 `<Subject N>`，时间、左右和缺席的人物由遮罩算出；`chunk_notes` 中本段以 `[Shot N]` 开头的行接在对应镜头后面（可写 `[Shot 4][Shot 7]` 同时指定多个），其余行附在最后。角色外观与替换指令请另外写在文字节点，再与 `shot_prompt` 拼接；填写 `subjects` 时，`shot_prompt` 已包含 `subject_definitions`、替换指令与去除遮罩颜色的要求，文字节点只需写与人物无关的通用要求，并接在 `shot_prompt` 之后。
+- shot_prompt：不经提示词模型、直接手写视频提示词时使用的英文逐镜头行，例如 `[Shot 2] 3.17s: <Subject 2> on the left, <Subject 1> on the right.`。遮罩第 N 个颜色对应 `<Subject N>`，时间与左右由遮罩算出，单人镜头也会标出位于画面哪一侧；不会写出缺席的人物（写“某人不在这个镜头”会让模型把他画进来）；`chunk_notes` 中本段以 `[Shot N]` 开头的行接在对应镜头后面（可写 `[Shot 4][Shot 7]` 同时指定多个），其余行附在最后。角色外观与替换指令请另外写在文字节点，再与 `shot_prompt` 拼接；填写 `subjects` 时，`shot_prompt` 已包含 `subject_definitions`、替换指令与去除遮罩颜色的要求，文字节点只需写与人物无关的通用要求，并接在 `shot_prompt` 之后。
 
 ### CS Seam Save / CS Seam Guide
 分段生成同一个镜头时，让下一段从上一段的结尾接续，避免接缝处画面跳变。需要本地 MiniMax H3 模型（`Add Guide for MiniMax H3`）。

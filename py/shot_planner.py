@@ -416,9 +416,11 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
                  subjects: dict[int, str] | None = None) -> str:
     """Per-shot lines for a hand-written video prompt, without a prompt model in between.
 
-    Mask colour N is ``<Subject N>``.  Times, sides and absences come from the
-    masks; ``[Shot N]`` lines in this chunk's part of ``notes`` are appended to
-    their shot, and its other lines follow the shots.
+    Mask colour N is ``<Subject N>``.  Times and sides come from the masks;
+    ``[Shot N]`` lines in this chunk's part of ``notes`` are appended to their
+    shot, and its other lines follow the shots.  A person alone in a shot gets
+    the half of the frame he is in, and nobody absent is named: "<Subject 2>
+    is not in this shot" makes the video model put <Subject 2> into it.
 
     With ``subjects`` the prompt defines and replaces only the people whose
     mask is in this chunk, and restates their appearance in every shot they are
@@ -445,7 +447,13 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
             item for item in present
             if any(flag and local_start <= position * int(item["step"]) < local_end for position, flag in enumerate(item["seen"]))
         ]
-        placed = sorted(zip(seen, _sides(seen, local_start, local_end)), key=lambda pair: pair[1] != "畫面左側")
+        sides = _sides(seen, local_start, local_end)
+        if len(seen) == 1 and not sides[0]:
+            item = seen[0]
+            centres = [value for position, value in enumerate(item["centres"])
+                       if item["seen"][position] and local_start <= position * int(item["step"]) < local_end]
+            sides = ["畫面左側" if sum(centres) / len(centres) < 0.5 else "畫面右側"]
+        placed = sorted(zip(seen, sides), key=lambda pair: pair[1] != "畫面左側")
         def looks(item: dict[str, Any]) -> str:
             subject = int(item["index"])
             if subject not in subjects:
@@ -456,10 +464,8 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
             f"<Subject {item['index']}>" + (f" on the {sides_en[side]}" if side else "") + looks(item)
             for item, side in placed
         )
-        absent = ", ".join(f"<Subject {item['index']}>" for item in present if item not in seen)
-        if absent:
-            verb = "is" if "," not in absent else "are"
-            shown = f"Only {shown}; {absent} {verb} not in this shot" if shown else f"{absent} {verb} not in this shot"
+        if shown and len(seen) < len(present):
+            shown = f"Only {shown}"
         line = f"[Shot {number}] {local_start / fps:.2f}s:"
         if shown:
             line += f" {shown}."
