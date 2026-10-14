@@ -584,6 +584,14 @@ SAM3.1 和 SeC-4B 共用同一个 Selector 框架。两者都支持多对象；S
 - 已经点击 `Apply to Node` 的工作流再次打开 Selector 时，会自动跳转到保存的（第一个）锚点帧并恢复提示。
 - `anchor_frame` 是当前输入帧批次的本地帧号。
 
+#### 镜头切点（仅 SAM3.1）
+
+- 时间线下方的红色标记是镜头切点（新镜头的第一帧）。`shot_cut_frames` 有值时显示该列表，留空时显示自动检测结果（需要 Selector 使用节点输入缓存，见 `wait_for_input_cache`）。
+- 逐帧找到新镜头的第一帧后，点击 `Add Cut Here` 或按 `C` 加入切点；在已有切点上再按一次移除误判的切点。
+- `‹ Cut` / `Cut ›` 跳到上一个/下一个切点。没有锚点的镜头在时间线下方以红色细条标示，`Next shot without anchor` 跳到下一个这样的镜头。
+- `Use detected cuts` 用自动检测结果替换当前列表。
+- `Preview Current Shot` 使用 Selector 中正在编辑的切点。`Apply to Node` 同时写入 `shot_cut_frames`；整段只有一个镜头时写入 `0`。
+
 #### Draw Mask
 
 - 进入 `Draw Mask` 后，鼠标光标显示当前画笔大小的半透明空心圆。
@@ -616,7 +624,7 @@ SAM3.1 和 SeC-4B 共用同一个 Selector 框架。两者都支持多对象；S
 - `Undo` / `Redo` 撤销或恢复最近一次提示编辑。
 - `Clear All Prompt` 清除所有对象的 Mask、BBox 和 Point。
 - `Preview Current Frame` 只运行当前锚点帧的模型分割，结果用于检查提示是否合理，不会替代最终整段视频执行。
-- `Preview Current Shot`（仅 SAM3.1）：按节点的 `shot_cut_frames`、`stop_at_shot_cuts`、`propagation_direction` 设置，只跟踪当前帧所在的镜头，与正式执行使用相同的传播逻辑。需要 Selector 使用节点输入缓存（见 `wait_for_input_cache`），运行时占用 GPU，建议在工作流未执行时使用。结果包括：
+- `Preview Current Shot`（仅 SAM3.1）：按 Selector 中的切点和节点的 `stop_at_shot_cuts`、`propagation_direction` 设置，只跟踪当前帧所在的镜头，与正式执行使用相同的传播逻辑。需要 Selector 使用节点输入缓存（见 `wait_for_input_cache`），运行时占用 GPU，建议在工作流未执行时使用。结果包括：
   - 逐帧面积曲线：每个 Object 一行，红色竖带标出面积明显低于该镜头常见面积的帧（常见于手脚漏抠或跟丢）；蓝色虚线为锚点，橙色线为当前帧。点击曲线跳转到对应帧。
   - 缩略图条：在镜头内平均抽取最多 10 帧并叠加 Object 颜色，点击跳转。
   - 逐帧叠加：在该镜头内拖动时间线或逐帧移动时，主画面直接显示跟踪结果。修改提示后标题会提示结果已过期，需要重新预览。

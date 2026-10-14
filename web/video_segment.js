@@ -43,11 +43,12 @@ registerVideoSelector({
     }),
     shotPreviewRoute: "/cinestyle/video-segment-shot-preview",
     shotMaskRoute: "/cinestyle/video-segment-shot-mask",
-    shotPreview: async ({ node, frame, promptData, fetchShotPreview }) => fetchShotPreview({
+    shotCuts: { widget: "shot_cut_frames", route: "/cinestyle/video-segment-shot-cuts" },
+    shotPreview: async ({ node, frame, promptData, shotCutFrames, fetchShotPreview }) => fetchShotPreview({
         frame,
         prompt_data: promptData,
         model_source: connectedModelSource(node),
-        shot_cut_frames: String(widget(node, "shot_cut_frames")?.value ?? ""),
+        shot_cut_frames: shotCutFrames ?? String(widget(node, "shot_cut_frames")?.value ?? ""),
         stop_at_shot_cuts: widget(node, "stop_at_shot_cuts")?.value !== false,
         propagation_direction: String(widget(node, "propagation_direction")?.value || "both"),
         max_objects: Number(widget(node, "max_objects")?.value || 16),

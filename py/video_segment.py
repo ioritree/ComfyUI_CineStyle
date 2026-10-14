@@ -2460,6 +2460,20 @@ def _selector_frame_batch(payload: dict[str, Any]) -> np.ndarray:
         raise ValueError("The cached Selector frames are unavailable. Run the workflow once again.") from exc
 
 
+def _selector_detected_cuts(payload: dict[str, Any], frames_u8: np.ndarray | None = None) -> list[int]:
+    """Detected cuts of the cached Selector input, decoding it only on a cache miss."""
+    key = str(payload.get("source_token") or "")
+    with _SHOT_PREVIEW_LOCK:
+        cached = _SHOT_PREVIEW_CUT_CACHE.get(key)
+    if cached is None:
+        if frames_u8 is None:
+            frames_u8 = _selector_frame_batch(payload)
+        cached = _detect_shot_cuts(torch.from_numpy(np.asarray(frames_u8)))
+        with _SHOT_PREVIEW_LOCK:
+            _SHOT_PREVIEW_CUT_CACHE[key] = cached
+    return cached
+
+
 def _encode_png(array: np.ndarray, mode: str) -> str:
     buffer = py_io.BytesIO()
     Image.fromarray(array, mode=mode).save(buffer, format="PNG", optimize=True)
@@ -2498,14 +2512,7 @@ def _shot_preview(payload: dict[str, Any]) -> dict[str, Any]:
         if manual is not None:
             cuts, cut_source = manual, "manual"
         else:
-            key = f"{payload.get('source_token')}:{frame_count}"
-            with _SHOT_PREVIEW_LOCK:
-                cached = _SHOT_PREVIEW_CUT_CACHE.get(key)
-            if cached is None:
-                cached = _detect_shot_cuts(torch.from_numpy(np.asarray(frames_u8)))
-                with _SHOT_PREVIEW_LOCK:
-                    _SHOT_PREVIEW_CUT_CACHE[key] = cached
-            cuts, cut_source = cached, "detected"
+            cuts, cut_source = _selector_detected_cuts(payload, frames_u8), "detected"
     bounds = [0, *cuts, frame_count]
     start = max(value for value in bounds[:-1] if value <= frame)
     end = min(value for value in bounds[1:] if value > frame)
@@ -2622,6 +2629,15 @@ async def _video_segment_shot_mask_route(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=400)
 
 
+async def _video_segment_shot_cuts_route(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+        cuts = await asyncio.to_thread(_selector_detected_cuts, payload)
+        return web.json_response({"cuts": cuts})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+
 async def _video_segment_shot_preview_route(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
@@ -2651,6 +2667,9 @@ class VideoSegmentExtension(ComfyExtension):
             )
             server_instance.routes.post("/cinestyle/video-segment-shot-preview")(
                 _video_segment_shot_preview_route
+            )
+            server_instance.routes.post("/cinestyle/video-segment-shot-cuts")(
+                _video_segment_shot_cuts_route
             )
             server_instance.routes.post("/cinestyle/video-segment-shot-mask")(
                 _video_segment_shot_mask_route
