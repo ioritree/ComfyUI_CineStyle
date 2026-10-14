@@ -177,12 +177,23 @@ async function openEditor(node) {
         return [...solid].sort((a, b) => a - b).map((shot) => bounds[shot] > 0 ? bounds[shot] : bounds[shot + 1] - 1);
     }
 
+    // A break re-plans the whole clip, so it can move chunks that were already
+    // rendered.  Adding one pins the starts of every chunk before the chunk it
+    // falls in; those chunks keep their ranges and numbers.
+    function pinnedStarts(frame) {
+        const target = plan.chunks.find((chunk) => chunk.start <= frame && frame < chunk.end);
+        if (!target) return [];
+        return plan.chunks.filter((chunk) => chunk.start > 0 && chunk.start <= target.start && !chunk.continues).map((chunk) => chunk.start);
+    }
+
     async function toggle(frames, remove = frames.every((frame) => breaks.includes(frame))) {
-        const next = remove ? breaks.filter((frame) => !frames.includes(frame)) : [...new Set([...breaks, ...frames])].sort((a, b) => a - b);
+        const pins = remove ? [] : pinnedStarts(Math.min(...frames)).filter((frame) => !breaks.includes(frame));
+        const next = remove ? breaks.filter((frame) => !frames.includes(frame)) : [...new Set([...breaks, ...pins, ...frames])].sort((a, b) => a - b);
         try {
             plan = await fetchPlan(node, next);
             breaks = plan.breaks;
             render();
+            if (pins.length) status.innerHTML += ` <span class="cs-sp-muted">· kept earlier chunks unchanged by also breaking at ${pins.join(", ")}</span>`;
         } catch (error) {
             status.innerHTML = `<span class="cs-sp-error">${escapeHtml(error.message)}</span>`;
         }

@@ -532,7 +532,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 - unload models before chunk：默认开启。每段开始前卸载上一次运行留在显存中的模型，避免显存累积；显存充足时可关闭，沿用已加载的模型以加快推理。开启时节点每次都会重新执行。
 - seam_overlap：默认 `0`。从镜头中间切开的片段，会在开头多生成上一段最后几帧，由 `CS Seam Guide` 锚定，拼接时裁掉。建议 `5`，可同时延续纹理与动作；落在真实切点上的片段不重叠。
 - chunk_notes：可选，按片段附加到 `shot_text` 之后的说明（例如动作时间轴）。每段以 `▼ chunk 1` 这样的一行开头，第一个标题之前的文字每段都会附加。提示词模型拿不到 `chunk_index`，把所有片段的时间轴一起给它会被混用。
-- chunk_breaks：可选，强制从这些切点开始新片段，通常由 Edit Chunks 填写。不在切点上的帧会被忽略。片段编号会随之改变，需同步修改 `chunk_notes`。
+- chunk_breaks：可选，强制从这些切点开始新片段，通常由 Edit Chunks 填写。不在切点上的帧会被忽略。切点之后的片段编号可能改变，需同步修改 `chunk_notes`。
 - blend：默认 `0.3`。`blend_mask` 中伪彩的不透明度，等同 ImageBlend 的 `blend_factor`。
 - solid_shots：可选，填镜头内任一原片帧号（例如镜头第一帧），这些镜头的 `blend_mask` 使用 `1.0`。适合整个画面被遮罩填满的局部特写（嘴唇、眼睛）：低 blend 会透出原片的痣和胡子，而全身镜头用 `1.0` 会被剪影轮廓锁住发型。
 - subjects：可选，每行一个 `<Subject N> 外观`，N 对应遮罩第 N 个颜色。填写后 `shot_prompt` 只定义、替换本段出现的人物，并在每个镜头重抄其外观；不在本段的人物不会出现在提示词里，避免模型把他画到别人身上。仅局部入镜的人物只标注可见部分。
@@ -542,6 +542,7 @@ SAM3.1 官方权重下载地址：[Comfy-Org/sam3.1](https://huggingface.co/Comf
 运行一次后点击节点上的 Edit Chunks，按镜头列出缩略图、所属片段、片段内的 `[Shot N]` 与秒数（与 `shot_text` 一致）以及原片帧范围。
 
 - 点击两个镜头之间的 ✂，强制从该切点开始新片段；再点一次取消。适合构图相似的相邻镜头被模型当成同一镜头、身份互相串用的情况。
+- 加入 ✂ 时，该切点所在片段之前的各片段起点会一并加入 `chunk_breaks`，这些片段的范围和编号保持不变，已经生成的片段可以直接沿用。不需要时可以再点那些 ✂ 取消。
 - Isolate 让单个镜头独立成段。很短的镜头会补到 124 帧，补齐比例在下方片段列表中标示；`padding` 为 `next shot frames` 时补齐帧会借用下一个镜头。
 - Solid 把该镜头加入 `solid_shots`，`blend_mask` 在这个镜头使用 `1.0`；再点一次取消。
 - 片段列表标出编号改变的片段（was chunk N），Set chunk_index 可直接切换要输出的片段。Apply 写入 `chunk_breaks` 与 `solid_shots`。
