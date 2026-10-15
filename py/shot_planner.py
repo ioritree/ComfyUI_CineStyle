@@ -497,6 +497,95 @@ def _shot_prompt(chunk: dict[str, Any], fps: float, frame_count: int, freeze: bo
     return "\n".join([*header, *lines, *others, footer])
 
 
+_SHEET_ENTRY = re.compile(r"\s*\[Shot\s*(\d+)\]\s*(?:([^|]*)\|)?\s*(.*)")
+_SHEET_TIME = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)(?:(\s*[–-]\s*)(\d+(?:\.\d+)?))?s\b")
+
+
+def _sheet_prompt(chunk: dict[str, Any], cuts: list[int], fps: float, frame_count: int, freeze: bool, sheet: str) -> str:
+    """The whole video prompt for this chunk from a shot sheet written once for the video.
+
+    ``[Shot N] S1:A S2 | text`` lines describe whole-video shot N, with times
+    relative to the shot's own start; the shot's subjects (``S1:A`` is subject 1
+    in variant A) choose what the template keeps.  Every other line is template:
+    ``{shots}`` marks where this chunk's shots go, ``<Subject N>`` lines stay only
+    when subject N is in the chunk, and ``{S2 S3}`` / ``{!S2 S3}`` keep a line only
+    when any / none of those subjects is.  Without masks nothing else tells the
+    video model who is absent, and a defined absentee gets painted in.
+    """
+    entries: dict[int, tuple[list[tuple[int, str]], str]] = {}
+    template = []
+    for line in sheet.splitlines():
+        match = _SHEET_ENTRY.match(line)
+        if match is None:
+            template.append(line)
+            continue
+        tokens = re.findall(r"S(\d+)(?::(\w+))?", match.group(2) or "", re.IGNORECASE)
+        entries[int(match.group(1))] = ([(int(number), variant) for number, variant in tokens], match.group(3).strip())
+
+    bounds = [0, *cuts, frame_count]
+    start = chunk["start"] - chunk["lead"]
+    numbered = []
+    for shot_start, shot_end in chunk["shots"]:
+        shot = bisect.bisect_right(bounds, shot_start)
+        if shot not in entries:
+            _LOGGER.warning("[CS Shot Planner] shot_sheet has no [Shot %d]", shot)
+        numbered.append((shot, shot_start, shot_end, *entries.get(shot, ([], ""))))
+    variants: dict[int, set[str]] = {}
+    for _, _, _, subjects, _ in numbered:
+        for number, variant in subjects:
+            variants.setdefault(number, set()).add(variant)
+    definitions: dict[tuple[int, str], str] = {}
+    for line in template:
+        match = re.match(r"\s*<Subject\s*(\d+):(\w+)>\s*(.+)", line)
+        if match:
+            definitions[(int(match.group(1)), match.group(2))] = match.group(3).strip()
+
+    lines = []
+    for local, (shot, shot_start, shot_end, subjects, text) in enumerate(numbered, start=1):
+        offset = (bounds[shot - 1] - start) / fps
+
+        def shifted(match: re.Match) -> str:
+            first = f"{float(match.group(1)) + offset:.2f}"
+            if match.group(3) is None:
+                return f"{first}s"
+            return f"{first}{match.group(2)}{float(match.group(3)) + offset:.2f}s"
+
+        worn = [definitions[(number, variant)] for number, variant in subjects
+                if variant and len(variants[number]) > 1 and (number, variant) in definitions]
+        body = " ".join([_SHEET_TIME.sub(shifted, text), *worn]).strip()
+        lines.append(f"[Shot {local}] {(shot_start - start) / fps:.2f}–{(shot_end - start) / fps:.2f}s: {body}")
+    if chunk["extra_frames"] > 0:
+        held = chunk["lead"] + chunk["frames"]
+        if not freeze and chunk["end"] < frame_count:
+            lines.append(f"[Shot {len(numbered) + 1}] {held / fps:.2f}s: the start of the next shot.")
+        else:
+            lines.append(f"From {held / fps:.2f}s the last frame holds still; there is no new shot.")
+
+    result = []
+    for line in template:
+        condition = re.match(r"\s*\{(!?)((?:\s*S\d+)+)\s*\}(.*)", line, re.IGNORECASE)
+        if condition:
+            wanted = {int(number) for number in re.findall(r"\d+", condition.group(2))}
+            if bool(wanted & variants.keys()) == (condition.group(1) == "!"):
+                continue
+            line = condition.group(3)
+        if line.strip() == "{shots}":
+            result.extend(lines)
+            continue
+        if re.match(r"\s*<Subject\s*\d+:\w+>", line):
+            continue
+        subject = re.match(r"\s*<Subject\s*(\d+)>", line)
+        if subject:
+            number = int(subject.group(1))
+            if number not in variants:
+                continue
+            used = [variant for variant in variants[number] if variant]
+            if len(used) == 1 and (number, used[0]) in definitions:
+                line = f"{line.rstrip()} {definitions[(number, used[0])]}"
+        result.append(line)
+    return "\n".join(result).strip()
+
+
 def _blend_weights(plan: dict[str, Any], chunk: dict[str, Any], length: int, freeze: bool,
                    blend: float, solid_frames: list[int]) -> list[float]:
     """Pseudo-colour opacity of each chunk frame: 1.0 in shots containing ``solid_frames``, else ``blend``.
@@ -761,6 +850,19 @@ class CSShotPlanner(io.ComfyNode):
                         "only the subjects whose mask is in this chunk, and repeats their appearance in each of their shots."
                     ),
                 ),
+                io.String.Input(
+                    "shot_sheet",
+                    default="",
+                    multiline=True,
+                    optional=True,
+                    tooltip=(
+                        "The whole prompt, written once for the video, for runs without masks. '[Shot N] S1:A S2 | text' "
+                        "describes whole-video shot N with times relative to that shot; other lines are the template, "
+                        "with {shots} where this chunk's shots go. <Subject N> lines stay only when a shot here lists SN, "
+                        "'<Subject N:A>' text is added for variant A, and '{S2 S3}' / '{!S2 S3}' keep a line only when "
+                        "any / none of them is here. Fills shot_prompt."
+                    ),
+                ),
             ],
             hidden=[io.Hidden.unique_id],
             outputs=[
@@ -815,6 +917,7 @@ class CSShotPlanner(io.ComfyNode):
         blend: float = 0.3,
         solid_shots: str = "",
         subjects: str = "",
+        shot_sheet: str = "",
         padding: str = "freeze last frame",
         shot_cut_frames: str = "",
         video_info: dict[str, Any] | None = None,
@@ -939,7 +1042,8 @@ class CSShotPlanner(io.ComfyNode):
             chunk_count,
             _shot_text(chunk, float(fps), frame_count, freeze, present, colors) + _chunk_note(chunk_notes, index),
             plan,
-            _shot_prompt(chunk, float(fps), frame_count, freeze, present, colors, chunk_notes, index, _parse_subjects(subjects)),
+            _sheet_prompt(chunk, plan["cuts"], float(fps), frame_count, freeze, shot_sheet) if str(shot_sheet or "").strip()
+            else _shot_prompt(chunk, float(fps), frame_count, freeze, present, colors, chunk_notes, index, _parse_subjects(subjects)),
             blend_mask,
         )
 
